@@ -276,6 +276,18 @@ class CalibrationProfile:
             worst = max(worst, levels.index(extrinsic_bucket))
         return levels[worst]
 
+    def undistort_frame(self, frame: "np.ndarray") -> "np.ndarray":
+        """Apply this profile's intrinsic lens-distortion correction --
+        thin pass-through to ``irix.barbell.calibration.undistort_frame``
+        (already the one implementation of this in the repo; this method
+        just saves every caller from having to unpack ``camera_matrix``/
+        ``dist_coeffs`` by hand). Only needs the intrinsic half of a
+        calibration, unlike ``to_camera_projection`` -- correct to call
+        even when ``extrinsic`` hasn't been run yet."""
+        from ..barbell.calibration import undistort_frame
+
+        return undistort_frame(frame, self.intrinsic.camera_matrix, self.intrinsic.dist_coeffs)
+
     def to_camera_projection(self) -> CameraProjection:
         """Convert to the shape ``irix.pose.multiview`` triangulation
         needs. Requires extrinsics -- raises ``ValueError`` (not a silent

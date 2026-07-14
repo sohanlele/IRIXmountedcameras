@@ -368,3 +368,103 @@ def test_single_member_station_never_triggers_disambiguation_buffering():
     rep_events = [e for e in events if e.to_dict()["event_type"] == "rep_completed"]
     assert len(rep_events) == 2
     assert all(e.member_id == "member-alice" for e in rep_events)
+
+
+class _RecordingCalibrationProfile:
+    """Stand-in for irix.pose.calibration.CalibrationProfile: records
+    every frame it's asked to undistort and returns a distinguishable
+    (but still valid) array, so a test can assert the pose estimator
+    actually received the undistorted frame, not the raw one."""
+
+    def __init__(self):
+        self.frames_seen = []
+
+    def undistort_frame(self, frame):
+        self.frames_seen.append(frame)
+        return frame + 1  # distinguishable from the raw all-zero input frame
+
+
+class _FrameRecordingPoseEstimator:
+    def __init__(self):
+        self.frames_seen = []
+
+    def estimate(self, frame):
+        self.frames_seen.append(frame)
+        return []
+
+
+def test_calibration_profile_undistorts_frames_before_pose_estimation():
+    """StationSessionRunner's Camera Streams -> Pose Estimation stage
+    should run every frame through the station's calibration_profile
+    first, when one is configured -- the "Camera Calibration" stage of
+    the authoritative pipeline (see irix/pipeline/rep_session.py /
+    docs/ARCHITECTURE.md). No calibration_profile (the default) must
+    leave frames untouched, unchanged from pre-Phase-3 behavior."""
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    present = [BLEReading(station_id="station-1", rssi=-40.0, timestamp=0.0, wristband_id="band-1")]
+
+    calibration = _RecordingCalibrationProfile()
+    pose_estimator = _FrameRecordingPoseEstimator()
+    runner = StationSessionRunner(
+        station_id="station-1",
+        exercise_name="squat",
+        checkout_registry=registry,
+        frame_source=_FakeFrameSource(3),
+        ble_reader=_ScriptedBLEReader([present] * 3),
+        pose_estimator=pose_estimator,
+        calibration_profile=calibration,
+        clock=_FakeClock(step=0.1),
+    )
+    runner.run_forever(max_frames=3)
+
+    assert len(calibration.frames_seen) == 3
+    # Every frame the pose estimator actually saw must be the
+    # *undistorted* one (raw + 1), not the raw all-zero frame.
+    assert len(pose_estimator.frames_seen) == 3
+    assert all(f.max() == 1 for f in pose_estimator.frames_seen)
+
+
+def test_calibrate_wristband_clock_corrects_that_bands_subsequent_imu_samples():
+    """calibrate_wristband_clock() is the intended entry point for an
+    explicit clock-sync calibration step (see its docstring for why this
+    repo doesn't auto-derive the observation from rep timestamps) --
+    once called for an open session's band, that band's RepSession
+    should apply the correction to every later add_imu_samples() batch."""
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    present = [BLEReading(station_id="station-1", rssi=-40.0, timestamp=0.0, wristband_id="band-1")]
+
+    true_lead_s = 0.35
+    imu_samples = synthetic_imu_stream(n_seconds=1.0, fs=30.0, reps_per_second=0.5, seed=1)
+    shifted = [
+        s.__class__(timestamp=s.timestamp + true_lead_s, accel=s.accel, gyro=s.gyro) for s in imu_samples
+    ]
+    imu_stream = _ChunkedIMUStream(shifted, samples_per_poll=5)
+
+    runner = StationSessionRunner(
+        station_id="station-1",
+        exercise_name="squat",
+        checkout_registry=registry,
+        frame_source=_FakeFrameSource(10),
+        ble_reader=_ScriptedBLEReader([present] * 10),
+        imu_stream_factory=lambda wid: imu_stream,
+        pose_estimator=_ScriptedPoseEstimator([]),
+        clock=_FakeClock(step=0.1),
+    )
+
+    # First tick opens the session (band becomes present) but hasn't
+    # calibrated yet -- its first polled batch should be stored raw.
+    runner.tick(frame=np.zeros((2, 2, 3), dtype=np.uint8), now=0.0, present_wristband_ids=["band-1"])
+    session = runner._sessions["band-1"]
+    assert session._imu_samples[0].timestamp == shifted[0].timestamp
+
+    calibrated = runner.calibrate_wristband_clock("band-1", offset_s=-true_lead_s, confidence=1.0, at_time=0.1)
+    assert calibrated is True
+
+    runner.tick(frame=np.zeros((2, 2, 3), dtype=np.uint8), now=0.2, present_wristband_ids=["band-1"])
+    corrected_batch = session._imu_samples[5:10]
+    assert corrected_batch[0].timestamp == pytest.approx(shifted[5].timestamp - true_lead_s, abs=1e-9)
+
+    # A band with no open session is a no-op, not an error.
+    assert runner.calibrate_wristband_clock("band-nonexistent", offset_s=0.1, confidence=1.0) is False

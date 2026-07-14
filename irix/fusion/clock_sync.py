@@ -129,6 +129,66 @@ def estimate_offset_via_cross_correlation(
     return offset_s, confidence
 
 
+def estimate_offset_from_paired_events(
+    reference_events: List[float], target_events: List[float], max_offset_s: float = 1.0,
+) -> Tuple[float, float]:
+    """Estimate a clock offset from two lists of discrete event
+    timestamps known to mark the *same physical instant* for each event
+    (not merely "the same rep" under two different detectors -- see the
+    warning below). A robust (median, not mean) aggregate of nearest-
+    neighbor pairwise residuals; more precise than
+    ``estimate_offset_via_cross_correlation`` when such directly
+    comparable discrete event times are already available, since no
+    resampling or signal-shape assumption is needed.
+
+    NOT safe to use for camera-detected rep-completion timestamps paired
+    against wristband-IMU-detected acceleration-peak timestamps for "the
+    same" rep -- this was tried for ``irix.pipeline.rep_session.
+    RepSession``'s per-set clock-sync observations and reverted, because
+    those two detectors flag different phases of a single rep cycle
+    (e.g. top-of-lift vs. peak concentric acceleration). Pairing them
+    conflates that fixed phase offset with genuine clock drift and
+    silently biases the result -- confirmed by
+    ``tests/test_rep_session_clock_sync.py``'s development history, kept
+    here as a cautionary note rather than deleted so the mistake isn't
+    repeated. Valid uses are pairs of events with matching physical
+    semantics on both sides, e.g. two independent IMU-based
+    motion-onset detectors, or the same detector's output read from two
+    cameras' overlapping fields of view.
+
+    Returns ``(offset_s, confidence)`` with the same sign convention as
+    ``estimate_offset_via_cross_correlation``: add ``offset_s`` to a
+    target timestamp to align it with the reference clock. Returns
+    ``(0.0, 0.0)`` when fewer than 2 events exist on either side (not
+    enough to trust a median) or every pairing is implausibly far apart.
+    """
+    if len(reference_events) < 2 or len(target_events) < 2:
+        return 0.0, 0.0
+
+    ref = np.sort(np.asarray(reference_events, dtype=float))
+    tgt = np.sort(np.asarray(target_events, dtype=float))
+
+    residuals = []
+    for r in ref:
+        idx = int(np.argmin(np.abs(tgt - r)))
+        residual = r - tgt[idx]  # add to target to align with reference
+        if abs(residual) <= max_offset_s * 3:  # drop implausible pairings
+            residuals.append(residual)
+
+    if len(residuals) < 2:
+        return 0.0, 0.0
+
+    residuals_arr = np.array(residuals)
+    offset = float(np.median(residuals_arr))
+    spread = float(np.std(residuals_arr))
+    # Tight, mutually-consistent residuals (every paired event agrees on
+    # roughly the same offset) => high confidence; scattered residuals
+    # (pairing was probably unreliable, e.g. missed/extra peaks on one
+    # side) => low confidence.
+    confidence = float(np.clip(1.0 - spread / max(max_offset_s, 1e-6), 0.0, 1.0))
+    return offset, confidence
+
+
 class ClockSyncEstimator:
     """Accumulates offset observations (each from
     ``estimate_offset_via_cross_correlation`` or supplied directly, e.g.

@@ -189,6 +189,22 @@ class WeightConfirmedEvent:
     # no barbell detector configured for this station).
     geometry_consistent: Optional[bool] = None
     geometry_check_reason: Optional[str] = None
+    # Independent color-coded-bumper-plate check (irix.weight_recognition.
+    # plate_color_check) -- the *primary* method when no VLM backend is
+    # configured (method == "color_plate" then), or a cross-check against
+    # a VLM read when one is (method == "vlm"). None if color-plate
+    # detection found nothing usable (unmarked/non-standard equipment) or
+    # was never run.
+    color_check_consistent: Optional[bool] = None
+    color_check_reason: Optional[str] = None
+    # How weight_kg/confidence were produced -- "vlm" (irix.
+    # weight_recognition.vision_classifier) or "color_plate" (irix.
+    # weight_recognition.plate_color_check, zero-training, no API key
+    # needed). Never fabricated -- an unconfident/ambiguous read simply
+    # never produces this event at all (see RepSession.process_frame's
+    # weight-check block), same "unknown over incorrect" principle as
+    # everywhere else in this repo.
+    method: str = "vlm"
 
     def to_dict(self) -> dict:
         return {
@@ -201,6 +217,9 @@ class WeightConfirmedEvent:
             "timestamp": self.timestamp,
             "geometry_consistent": self.geometry_consistent,
             "geometry_check_reason": self.geometry_check_reason,
+            "color_check_consistent": self.color_check_consistent,
+            "color_check_reason": self.color_check_reason,
+            "method": self.method,
         }
 
 

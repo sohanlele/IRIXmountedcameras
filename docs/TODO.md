@@ -1,6 +1,6 @@
 # TODO
 
-Prioritized, actionable. Refreshed end of Phase 2 (2026-07-14) -- items
+Prioritized, actionable. Refreshed during Phase 3 (2026-07-14) -- items
 completed this phase removed, new gaps this phase's work surfaced added.
 
 ## High priority
@@ -9,22 +9,57 @@ completed this phase removed, new gaps this phase's work surfaced added.
       start** so a station can auto-detect/confirm the exercise instead
       of only trusting `StationInfo.default_exercise` -- needs a real
       state-machine decision (a detection preamble before `RepSession`
-      commits to one exercise's joint triplet), deliberately not bolted
-      on with the rest of Phase 2's work to avoid destabilizing
-      `RepSession`'s existing, well-tested behavior. See
-      `irix/exercise_recognition/__init__.py` for the extension point.
-- [ ] **Wire `irix.pose.tracker.TrackedPoseEstimator` in as
-      `StationSessionRunner`'s default** (currently opt-in) once its
-      behavior has been validated against a real multi-person camera
-      feed -- persistent track_id also opens the door to a future
-      pixel-based crowded-station disambiguation signal alongside the
-      existing motion-correlation one.
-- [ ] **Wire `irix.fusion.clock_sync.ClockSyncEstimator` into a live
-      entry point** (e.g. `StationSessionRunner`, applying
-      `apply_clock_sync` to polled IMU samples before they reach
-      `RepSession`) -- the estimator and the simulated ground-truth
-      validation (`irix.wristband_sim`'s `clock_drift_ppm`) both exist
-      now, but nothing in the live path actually calls it yet.
+      commits to one exercise's joint triplet). Scoped into the Phase 3
+      workout-state-machine work (`ExerciseCandidate`/`ExerciseConfirmed`
+      states) rather than bolted onto `RepSession` directly, since that
+      state machine is exactly where a "not yet confirmed" exercise
+      needs to live. See `irix/exercise_recognition/__init__.py` for the
+      extension point.
+- [x] ~~Wire `irix.pose.tracker.TrackedPoseEstimator` in as
+      `StationSessionRunner`'s default~~ -- done: `_ensure_estimator()`
+      now wraps a real (caller-omitted) `PoseEstimator` in
+      `TrackedPoseEstimator` by default; any caller that injects its own
+      `pose_estimator` (every existing test/demo) is untouched. **Not
+      yet validated against a real multi-person camera feed** -- no
+      `ultralytics`/camera hardware in this sandbox, so this is
+      integration-correct but accuracy-unvalidated; see
+      `docs/VALIDATION.md`.
+- [x] ~~Wire `irix.fusion.clock_sync.ClockSyncEstimator` into a live
+      entry point~~ -- done, but not the way this bullet originally
+      envisioned. `StationSessionRunner` now builds one
+      `ClockSyncEstimator` per open session and every `add_imu_samples`
+      call applies its current correction (`RepSession`/
+      `station_runner.py`). What did **not** get built: automatic
+      per-set observation derivation from camera-rep-vs-IMU-peak
+      timestamp pairing -- tried, and reverted, because a camera's
+      rep-*completion* timestamp and an IMU counter's acceleration-
+      *peak* timestamp mark different phases of one physical rep, so
+      pairing them conflates a fixed phase offset with genuine clock
+      drift (see `irix/fusion/clock_sync.py`'s
+      `estimate_offset_from_paired_events` docstring and
+      `tests/test_rep_session_clock_sync.py` for the full account).
+      `StationSessionRunner.calibrate_wristband_clock()` is the real
+      entry point now -- a caller supplies a trustworthy
+      `(offset_s, confidence)` pair. **Next step**: build that caller --
+      a calibration routine using
+      `estimate_offset_via_cross_correlation` against camera-tracked
+      wrist-keypoint vertical velocity (available every frame from
+      `PersonPose`, no barbell required, unlike bar-path velocity) and
+      raw wristband vertical accel over the same window. Not yet built.
+- [x] ~~Wire camera-calibration undistortion into a live entry point~~ --
+      done: `CalibrationProfile.undistort_frame()` (thin wrapper around
+      `irix.barbell.calibration.undistort_frame`) is now applied to
+      every frame in `StationSessionRunner.tick()` before pose
+      estimation, when a `calibration_profile` is configured for the
+      station (optional -- `None` skips undistortion unchanged).
+- [x] ~~Wire `irix.weight_recognition.plate_color_check` into the
+      production weight-recognition path~~ -- done: `RepSession`'s
+      weight-check block now runs color-plate detection on every
+      periodic check regardless of whether a VLM backend is configured
+      (`method="color_plate"`, zero-training, no API key), and
+      cross-checks it against a VLM read (`method="vlm"`) when one is
+      configured (`WeightConfirmedEvent.color_check_consistent`/
+      `color_check_reason`, alongside the existing geometry check).
 - [ ] **Wire `irix.wristband_sim.calibration.calibrate_stationary` into
       a real entry point** (still open from Phase 1 -- see
       `docs/WRISTBAND_SYSTEM.md`).

@@ -29,6 +29,7 @@ from ..barbell.tracker import BarPathTracker
 from ..fatigue.models import RepFatigueSample
 from ..fatigue.session_analysis import SessionFatigueTracker
 from ..fatigue.set_analysis import SetFatigueAnalyzer
+from ..fusion.clock_sync import ClockSyncEstimator, apply_clock_sync
 from ..fusion.imu import IMUSample
 from ..fusion.rep_fusion import RepCountFusion
 from ..form.scoring import FormScorer
@@ -36,6 +37,7 @@ from ..pose.estimator import PersonPose
 from ..pose.geometry import joint_angle
 from ..rep_counting.exercises import EXERCISES
 from ..rep_counting.state_machine import RepCounter
+from ..weight_recognition.plate_color_check import detect_color_plates, estimate_load_from_color_plates
 from ..weight_recognition.plate_geometry_check import check_plate_geometry
 from ..weight_recognition.vision_classifier import VisionPlateClassifier
 from ..weight_recognition.vlm_backend import VLMBackend
@@ -62,6 +64,7 @@ class RepSession:
         camera_tilt_deg: float = 0.0,
         camera_tilt_deg_by_camera: Optional[Dict[str, float]] = None,
         start_ts: Optional[float] = None,
+        clock_sync_estimator: Optional[ClockSyncEstimator] = None,
     ):
         """``camera_tilt_deg``: the tilt correction to use for whichever
         camera's frames arrive without a more specific entry in
@@ -90,6 +93,30 @@ class RepSession:
         caller that doesn't supply one; a caller that cares about
         deterministic replay (``irix.demo.run_live_gym_demo``,
         ``irix.live.station_runner``) should supply it.
+
+        ``clock_sync_estimator``: shared ``irix.fusion.clock_sync.
+        ClockSyncEstimator`` this session corrects incoming IMU samples
+        against (Phase 3 default production behavior -- see
+        ``irix.live.station_runner.StationSessionRunner``, which
+        constructs one per session by default). Every ``add_imu_samples``
+        call applies the estimator's *current* best offset before
+        samples are stored. ``None`` (default) disables this -- no
+        correction is applied, unchanged from pre-Phase-3 behavior.
+
+        This class deliberately does NOT auto-populate the estimator's
+        observations from its own camera-rep-vs-IMU-peak timestamps. That
+        was tried during development and reverted: a camera's
+        rep-*completion* timestamp and an IMU counter's acceleration-
+        *peak* timestamp mark different phases of the same physical rep
+        (e.g. top-of-lift vs. peak concentric acceleration), so pairing
+        them conflates a fixed phase offset with actual clock drift and
+        silently biases the estimate -- worse than not auto-calibrating
+        at all. Populate the estimator from a source that pairs directly
+        comparable signals instead, e.g. ``irix.fusion.clock_sync.
+        estimate_offset_via_cross_correlation`` against camera-derived
+        joint-angle velocity and raw wrist accel magnitude over the same
+        window (see that function's tests for a validated example), run
+        as an explicit calibration step rather than inferred per-set.
         """
         if exercise_name not in EXERCISES:
             raise ValueError(f"Unknown exercise {exercise_name!r} -- choices: {sorted(EXERCISES)}")
@@ -121,6 +148,8 @@ class RepSession:
         # must never be applied to camera B's.
         self._bar_calibrations: Dict[Optional[str], CameraCalibration] = {}
 
+        self.clock_sync_estimator = clock_sync_estimator
+
         self._imu_samples: List[IMUSample] = []
         self._set_reps: List[RepFatigueSample] = []
         self._set_start_ts: Optional[float] = None
@@ -149,7 +178,18 @@ class RepSession:
         tick (see ``irix.live.station_runner``). Either way, samples just
         accumulate here and get sliced to the right set's time window
         when that set closes -- the two callers don't need any different
-        logic downstream of this."""
+        logic downstream of this.
+
+        If ``clock_sync_estimator`` was supplied, every incoming batch is
+        corrected against its *current* best offset estimate before being
+        stored (a no-op, offset 0.0, until the first set closes and
+        produces an observation -- see ``_close_set``)."""
+        if not samples:
+            return
+        if self.clock_sync_estimator is not None:
+            estimate = self.clock_sync_estimator.estimate()
+            if estimate.n_observations > 0:
+                samples = apply_clock_sync(samples, estimate)
         self._imu_samples.extend(samples)
 
     def process_frame(
@@ -176,27 +216,77 @@ class RepSession:
         events: List[CameraEvent] = []
         self._frame_count += 1
 
-        # -- weight recognition (periodic, real VLM call if configured) --
-        if self.weight_classifier is not None and self._frame_count % self.weight_check_every_n_frames == 0:
-            reading = self.weight_classifier.read_frame(frame)
-            if reading is not None:
+        # -- weight recognition (periodic; color-plate check always runs
+        # since it needs no model/API key, VLM only if configured) --
+        if self._frame_count % self.weight_check_every_n_frames == 0:
+            color_estimate = estimate_load_from_color_plates(detect_color_plates(frame))
+            vlm_reading = self.weight_classifier.read_frame(frame) if self.weight_classifier is not None else None
+
+            if vlm_reading is not None:
+                # VLM is the primary read when configured; color-plate
+                # detection becomes a cross-check alongside the existing
+                # geometry one, same "independent corroborating signal"
+                # role plate_color_check.py's own docstring describes.
                 geometry_consistent = None
                 geometry_reason = None
                 if self.barbell_detector is not None:
                     detections = self.barbell_detector.detect(frame)
-                    gcheck = check_plate_geometry(reading.value, detections)
+                    gcheck = check_plate_geometry(vlm_reading.value, detections)
                     geometry_consistent = gcheck.consistent
                     geometry_reason = gcheck.reason
-                self._current_weight_kg = reading.value
+                color_consistent = None
+                color_reason = None
+                if color_estimate.total_weight_kg is not None:
+                    color_consistent = abs(color_estimate.total_weight_kg - vlm_reading.value) < 1e-6 or                         abs(color_estimate.total_weight_kg - vlm_reading.value) <= 0.05 * vlm_reading.value
+                    color_reason = (
+                        f"color_plate_read={color_estimate.total_weight_kg}kg vs vlm_read={vlm_reading.value}kg"
+                    )
+                self._current_weight_kg = vlm_reading.value
                 events.append(
                     WeightConfirmedEvent(
                         member_id=self.member_id,
                         station_id=self.station_id,
                         exercise=self.exercise_name,
-                        weight_kg=reading.value,
-                        confidence=reading.confidence,
+                        weight_kg=vlm_reading.value,
+                        confidence=vlm_reading.confidence,
                         geometry_consistent=geometry_consistent,
                         geometry_check_reason=geometry_reason,
+                        color_check_consistent=color_consistent,
+                        color_check_reason=color_reason,
+                        method="vlm",
+                        timestamp=ts,  # this frame's own timestamp, not wall-clock
+                    )
+                )
+            elif color_estimate.total_weight_kg is not None and color_estimate.confidence >= 0.5:
+                # No VLM configured (no API key / not wired for this
+                # station) -- color-coded-bumper-plate detection is a
+                # complete, zero-training method on its own for
+                # equipment that follows the IWF color standard. Never
+                # fabricated: estimate_load_from_color_plates already
+                # returns total_weight_kg=None for anything it can't
+                # confidently, symmetrically pair (see that function's
+                # docstring), so reaching here means a real, confident
+                # read -- not a guess.
+                geometry_consistent = None
+                geometry_reason = None
+                if self.barbell_detector is not None:
+                    detections = self.barbell_detector.detect(frame)
+                    gcheck = check_plate_geometry(color_estimate.total_weight_kg, detections)
+                    geometry_consistent = gcheck.consistent
+                    geometry_reason = gcheck.reason
+                self._current_weight_kg = color_estimate.total_weight_kg
+                events.append(
+                    WeightConfirmedEvent(
+                        member_id=self.member_id,
+                        station_id=self.station_id,
+                        exercise=self.exercise_name,
+                        weight_kg=color_estimate.total_weight_kg,
+                        confidence=color_estimate.confidence,
+                        geometry_consistent=geometry_consistent,
+                        geometry_check_reason=geometry_reason,
+                        color_check_consistent=True,
+                        color_check_reason=color_estimate.reason,
+                        method="color_plate",
                         timestamp=ts,  # this frame's own timestamp, not wall-clock
                     )
                 )

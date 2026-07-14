@@ -77,6 +77,7 @@ import time
 from typing import Callable, Dict, List, Optional
 
 from ..barbell.detector import FreeWeightDetector
+from ..fusion.clock_sync import ClockSyncEstimator
 from ..fusion.imu import IMUSample
 from ..fusion.imu_stream import IMUStream
 from ..identity.ble_pairing import BLEReading
@@ -84,6 +85,7 @@ from ..identity.checkout import CheckoutRegistry
 from ..identity.motion_correlation import MotionCorrelationResolver
 from ..pipeline.rep_session import RepSession
 from ..pipeline.schema import CameraEvent
+from ..pose.calibration import CalibrationProfile
 from ..weight_recognition.vlm_backend import VLMBackend
 from .disambiguation import CrowdedGroupDisambiguator
 
@@ -107,6 +109,7 @@ class StationSessionRunner:
         clock: Optional[Callable[[], float]] = None,
         motion_resolver: Optional[MotionCorrelationResolver] = None,
         disambiguation_window_frames: int = 60,
+        calibration_profile: Optional[CalibrationProfile] = None,
     ):
         """``ble_reader``: called once per frame tick (in ``run_forever``
         only -- ``tick()`` called directly, e.g. by ``irix.live.
@@ -138,6 +141,17 @@ class StationSessionRunner:
         crowded station (2+ checked-out bands present at once) gets
         disambiguated -- see the module docstring. Irrelevant whenever at
         most one band is present, which is the common case.
+
+        ``calibration_profile``: this station's install-time ``irix.
+        pose.calibration.CalibrationProfile`` (checkerboard intrinsics,
+        see that module), applied to undistort every frame before it
+        reaches ``pose_estimator`` -- the "Camera Calibration" stage of
+        the authoritative pipeline (Camera Streams -> Pose Estimation ->
+        Tracking -> Camera Calibration -> ...). ``None`` (default) skips
+        undistortion, unchanged from pre-Phase-3 behavior -- correct for
+        any camera whose lens distortion hasn't been calibrated yet
+        rather than silently running uncorrected pose estimation through
+        a calibration step that doesn't exist for it.
         """
         self.station_id = station_id
         self.exercise_name = exercise_name
@@ -146,6 +160,7 @@ class StationSessionRunner:
         self.ble_reader = ble_reader
         self.imu_stream_factory = imu_stream_factory
         self.pose_estimator = pose_estimator
+        self.calibration_profile = calibration_profile
         self.presence_timeout_s = presence_timeout_s
         self._clock = clock or time.monotonic
         self._session_kwargs = dict(
@@ -162,12 +177,29 @@ class StationSessionRunner:
         self._sessions: Dict[str, RepSession] = {}
         self._imu_streams: Dict[str, Optional[IMUStream]] = {}
         self._last_seen: Dict[str, float] = {}
+        # One ClockSyncEstimator per currently-open session (Phase 3
+        # default production behavior) -- correction is applied to every
+        # add_imu_samples() call from the moment it exists, but it starts
+        # with zero observations (a no-op) until something calls
+        # calibrate_wristband_clock() for that band. See that method's
+        # docstring for why this repo doesn't auto-derive observations
+        # from RepSession's own per-set rep timestamps.
+        self._clock_sync_estimators: Dict[str, ClockSyncEstimator] = {}
 
     def _ensure_estimator(self):
         if self.pose_estimator is None:
+            # Default production path only -- a caller that injects its
+            # own pose_estimator (every existing test/demo that needs
+            # deterministic synthetic output) keeps getting exactly what
+            # it passed in, untouched. Real deployments get persistent
+            # track_id (irix.pose.tracker.PoseTracker, ByteTrack-derived)
+            # by default, not as an opt-in extra step -- see
+            # irix/pose/tracker.py's module docstring for why that
+            # matters for a crowded, multi-person station.
             from ..pose.estimator import PoseEstimator
+            from ..pose.tracker import TrackedPoseEstimator
 
-            self.pose_estimator = PoseEstimator()
+            self.pose_estimator = TrackedPoseEstimator(PoseEstimator())
         return self.pose_estimator
 
     def _resolve_present_wristbands(self) -> List[str]:
@@ -187,21 +219,25 @@ class StationSessionRunner:
     def _start_session(self, wristband_id: str, now: float) -> None:
         member_id = self.checkout_registry.resolve_member(wristband_id)
         assert member_id is not None  # guaranteed by callers checking is_checked_out first
+        clock_sync_estimator = ClockSyncEstimator()
         session = RepSession(
             exercise_name=self.exercise_name,
             member_id=member_id,
             station_id=self.station_id,
             start_ts=now,
+            clock_sync_estimator=clock_sync_estimator,
             **self._session_kwargs,
         )
         self._on_events(session.initial_events)
         self._sessions[wristband_id] = session
+        self._clock_sync_estimators[wristband_id] = clock_sync_estimator
         self._imu_streams[wristband_id] = self.imu_stream_factory(wristband_id) if self.imu_stream_factory else None
 
     def _end_session(self, wristband_id: str, end_ts: float) -> None:
         session = self._sessions.pop(wristband_id, None)
         self._imu_streams.pop(wristband_id, None)
         self._last_seen.pop(wristband_id, None)
+        self._clock_sync_estimators.pop(wristband_id, None)
         if session is not None:
             self._on_events(session.close(end_ts=end_ts))
         # A session ending always coincides with a present-set change,
@@ -210,6 +246,36 @@ class StationSessionRunner:
         # slightly-earlier-than-strictly-necessary reset, not a behavior
         # change (see CrowdedGroupDisambiguator.reset()'s docstring).
         self._disambiguator.reset()
+
+    def calibrate_wristband_clock(
+        self, wristband_id: str, offset_s: float, confidence: float, at_time: Optional[float] = None,
+    ) -> bool:
+        """Record a clock-offset observation for a currently-open
+        session's wristband, so its ``RepSession``'s ``add_imu_samples``
+        starts correcting incoming samples against it. Returns whether a
+        session for this band was actually open to receive it.
+
+        Deliberately a thin pass-through to ``ClockSyncEstimator.
+        add_observation`` rather than something this class derives on its
+        own: this repo does NOT auto-derive clock-sync observations from
+        camera-rep-vs-IMU-peak timestamp pairing (see ``irix.pipeline.
+        rep_session.RepSession``'s ``__init__`` docstring and ``irix.
+        fusion.clock_sync.estimate_offset_from_paired_events``'s
+        docstring for the phase-offset bug that approach has). The
+        caller is responsible for computing a trustworthy ``(offset_s,
+        confidence)`` pair from directly-comparable signals -- e.g.
+        ``irix.fusion.clock_sync.estimate_offset_via_cross_correlation``
+        against camera-tracked wrist-keypoint vertical velocity and raw
+        wristband vertical accel over the same window (see that
+        function's tests; wiring an automatic per-tick caller for this
+        is tracked in ``docs/TODO.md``, not yet built)."""
+        estimator = self._clock_sync_estimators.get(wristband_id)
+        if estimator is None:
+            return False
+        estimator.add_observation(
+            at_time=at_time if at_time is not None else self._clock(), offset_s=offset_s, confidence=confidence,
+        )
+        return True
 
     def tick(self, frame, now: float, present_wristband_ids: List[str]) -> None:
         """One frame's worth of work, given an *already-resolved* list of
@@ -251,6 +317,8 @@ class StationSessionRunner:
         if not self._sessions:
             return
 
+        if self.calibration_profile is not None:
+            frame = self.calibration_profile.undistort_frame(frame)
         estimator = self._ensure_estimator()
         people = estimator.estimate(frame)
 

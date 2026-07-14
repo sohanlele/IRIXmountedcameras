@@ -146,6 +146,14 @@ def detect_color_plates(
         x_offset, y_offset = x1, y1
     if image.size == 0:
         return []
+    if image.dtype != np.uint8:
+        # cv2.cvtColor's BGR2HSV only supports uint8/float32 -- a caller
+        # passing e.g. a float64 debug/synthetic frame (real camera
+        # frames are always uint8) would otherwise crash this check and
+        # take the whole per-frame pipeline down with it. Assumes an
+        # already-0..255-range image (true for every real and synthetic
+        # frame in this repo); this is a dtype fix, not a rescale.
+        image = np.clip(image, 0, 255).astype(np.uint8)
 
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     detections: List[PlateColorDetection] = []
