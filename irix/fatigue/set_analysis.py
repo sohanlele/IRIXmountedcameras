@@ -10,6 +10,17 @@ from .models import RepFatigueSample, SetFatigueAnalysis
 # exceeds wins -- matches how VL10/VL20/VL30/VL45 are used as named zones
 # in the VBT literature cited in irix.barbell.rpe (a set with 32% loss is
 # "in VL30", not double-counted as also being in VL10).
+#
+# Cross-checked (2026-07-14) against subsequent autoregulation research
+# beyond what irix.barbell.rpe already cites: Chiang, Chiang, Chen &
+# Weakley (2025), "'Which autoregulation strategy should we use?' The
+# effects of velocity loss thresholds on RPE and their individual
+# differences in the back squat" (Sports Med) and related 2024-2025 work
+# both treat 20% velocity loss as a standard real-time autoregulation
+# threshold and report velocity-loss thresholds <=25% associated with the
+# best 1RM strength outcomes -- consistent with (not a correction to) the
+# VL20 boundary already used here; no threshold values changed as a
+# result, just corroborated against more recent literature.
 _VELOCITY_LOSS_ZONES = [(45.0, "VL45"), (30.0, "VL30"), (20.0, "VL20"), (10.0, "VL10")]
 
 

@@ -21,6 +21,17 @@ synchronization literature (camera + wearable-accelerometer normalized
 cross-correlation, used for both identity assignment and clock
 synchronization without any calibration step or auxiliary sensor).
 
+Also independently corroborated on the IMU side alone: Zou, Choi et al.,
+"Person Re-Identification Using Deep Modeling of Temporally Correlated
+Inertial Motion Patterns" (Sensors, 2020) re-identifies individuals from
+wearable accelerometer/gyroscope motion signatures across 86 subjects,
+confirming that an IMU's temporal motion pattern carries enough
+person-distinguishing signal on its own to be a legitimate re-
+identification feature -- the same premise this module leans on for the
+IMU half of the cross-modal correlation, arrived at here independently
+before that specific citation was found (2026-07-14 competitive/prior-art
+review), not built from it.
+
 **Known limitation, stated plainly** (same standard of honesty this repo
 applies to every proxy signal -- see e.g. ``irix.rep_counting``'s
 angular-velocity-proxy docstring): a wearable's raw accelerometer

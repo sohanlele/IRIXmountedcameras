@@ -36,7 +36,11 @@ class BarPathTracker:
     ``push`` takes a raw pixel y-coordinate (vertical axis; "up" is
     assumed to be decreasing pixel y, standard image coordinates) and
     converts it to meters via the station's ``CameraCalibration`` before
-    buffering, so all downstream math is in real units.
+    buffering, so all downstream math is in real units. Uses
+    ``CameraCalibration.pixels_to_vertical_m`` (not ``pixels_to_m``), so a
+    station with a nonzero ``camera_tilt_deg`` gets its bar-path distance
+    (and therefore velocity) corrected for that tilt -- see
+    ``irix.barbell.calibration``'s module docstring.
     """
 
     def __init__(self, calibration: CameraCalibration, max_buffer_s: float = 30.0):
@@ -48,7 +52,7 @@ class BarPathTracker:
         # Image-coordinate y increases downward; flip sign so "up" (bar
         # ascending, concentric phase of a squat/bench/deadlift) is a
         # positive position change, matching how a lifter would describe it.
-        position_m = -self.calibration.pixels_to_m(y_px)
+        position_m = -self.calibration.pixels_to_vertical_m(y_px)
         self._samples.append((timestamp, position_m))
         cutoff = timestamp - self.max_buffer_s
         self._samples = [(t, p) for t, p in self._samples if t >= cutoff]

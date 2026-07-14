@@ -21,6 +21,15 @@ original design doc where research turned up a better-supported approach
 section-by-section mapping, every divergence's reasoning, and what's
 deliberately left unimplemented.
 
+**Privacy, by construction, not as an afterthought:** every identity
+decision in this repo (`CheckoutRegistry`, `GymCoordinator`,
+`MotionCorrelationResolver`) resolves *which wristband*, never *whose
+face* -- `PoseEstimator` outputs a skeleton, not a face-geometry
+embedding. Under BIPA and similar state biometric-privacy laws, recording
+video isn't the regulated act, building a faceprint from it is; this
+design never does the latter. See `docs/ARCHITECTURE.md`'s "Where this
+repo ends and irix-mvp-app begins" section for the full reasoning.
+
 **Status:** early scaffold, not production code. No camera/network
 hardware or wristband firmware is included -- those are hardware/
 deployment concerns outside a software repo's scope. Model weights are a
@@ -281,7 +290,7 @@ irix/
   fatigue/             set + session-level fatigue analysis (velocity loss %, VL-zone classification, tempo drift, form trend) aggregated for irix-mvp-app's AI context
   topology/            multi-camera station registry (10-camera example layout) + BLE-hysteresis member handoff, gating which station's events are authoritative to prevent double-counting
   identity/            BLE RSSI station-pairing heuristic + motion-correlation disambiguation (camera wrist motion vs. wristband IMU) for when two members' bands are both in range of one station; checkout.py is the front-desk wristband-to-account link (CheckoutRegistry)
-  barbell/             self-calibrated (no environment edits) barbell/plate/dumbbell tracking, m/s bar velocity, RPE/velocity-loss estimation
+  barbell/             self-calibrated (no environment edits) barbell/plate/dumbbell tracking, m/s bar velocity, RPE/velocity-loss estimation, optional GymAware-style camera-tilt correction for stations whose camera isn't perfectly perpendicular to the bar path
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, geometric plate-count cross-check, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
   pipeline/           edge buffer -> aggregator -> cloud sync; structured CameraEvent family (the API contract with irix-mvp-app); rep_session.py is the per-member pipeline (rep/form/weight/barbell/fatigue) shared by run_upload and the live station runner
   live/               24/7-station pieces: camera_source.py (ReconnectingFrameSource, reconnects on drop instead of exiting), station_runner.py (StationSessionRunner -- ties checkout + BLE presence + live camera + live IMU + RepSession into one continuously-running station), gym_runner.py (GymSessionRunner -- runs several stations together with GymCoordinator-backed handoff so a member walking between them is never double-counted)

@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from irix.barbell.calibration import calibrate_from_known_object, COMPETITION_BUMPER_PLATE_DIAMETER_MM
@@ -63,3 +65,37 @@ def test_reset_clears_buffer():
     tracker.push(0.1, 990.0)
     tracker.reset()
     assert tracker._samples == []
+
+
+def test_camera_tilt_correction_increases_measured_velocity():
+    # Same raw pixel-per-frame ascent fed through two trackers, one at a
+    # station with a tilted camera -- the tilted station's calibration
+    # should report a *higher* real-world velocity for identical pixel
+    # motion, since pixels_to_vertical_m corrects for the foreshortening
+    # a tilted camera introduces (see irix.barbell.calibration's
+    # module docstring / GymAware LPT cable-angle-correction precedent).
+    cal_level = calibrate_from_known_object(
+        pixel_size=180.0, real_world_size_mm=COMPETITION_BUMPER_PLATE_DIAMETER_MM, station_id="s1",
+    )
+    cal_tilted = calibrate_from_known_object(
+        pixel_size=180.0, real_world_size_mm=COMPETITION_BUMPER_PLATE_DIAMETER_MM, station_id="s2",
+        camera_tilt_deg=30.0,
+    )
+    tracker_level = BarPathTracker(cal_level)
+    tracker_tilted = BarPathTracker(cal_tilted)
+
+    fps = 30
+    y0_px = 1000.0
+    px_per_frame = 5.0
+    for i in range(31):
+        t = i / fps
+        y_px = y0_px - px_per_frame * i
+        tracker_level.push(t, y_px)
+        tracker_tilted.push(t, y_px)
+
+    level_result = tracker_level.velocity_for_window(0.0, 1.0)
+    tilted_result = tracker_tilted.velocity_for_window(0.0, 1.0)
+    assert tilted_result.mean_velocity_m_s > level_result.mean_velocity_m_s
+    assert tilted_result.mean_velocity_m_s == pytest.approx(
+        level_result.mean_velocity_m_s / math.cos(math.radians(30.0)), rel=1e-6
+    )

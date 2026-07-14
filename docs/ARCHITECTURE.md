@@ -114,6 +114,49 @@ is a placeholder pointed at wherever that endpoint ends up.
 | 7 / 7.1 Real-time audio coaching | -- (owned by irix-mvp-app) | Out of scope for this repo -- see "Where this repo ends" above. `BandPlacementTracker` emits the one coaching-adjacent *event*, but not the instruction text itself |
 | 8 Privacy & data handling | `irix/pipeline/schema.py` | Every `CameraEvent` subtype intentionally carries no video/biometric fields (tested) |
 
+**Privacy positioning, stated explicitly (2026-07-14 competitive/legal
+review):** under Illinois's BIPA and similar state biometric-privacy
+laws, *recording video is not the regulated act -- building a faceprint
+from it is*. A biometric identifier under BIPA is specifically a scan of
+face/hand geometry, retina/iris, fingerprint, or voiceprint; this repo
+never computes one -- `PoseEstimator` outputs a skeleton (keypoint
+positions, not a face-geometry embedding), and every identity decision
+anywhere in this codebase (`CheckoutRegistry`, `GymCoordinator`,
+`MotionCorrelationResolver`) resolves *which wristband*, never *whose
+face*. That's a real, load-bearing design property here, not an
+afterthought bolted on for compliance -- it's the direct consequence of
+building identity around a front-desk-issued wristband instead of face
+recognition in the first place (see "Multi-station deployment" and "Live
+station readiness" below for how). Worth stating plainly in any pitch or
+compliance conversation: this design sits outside BIPA's scope by
+construction. (GroeFit, a commercial-gym camera-analytics competitor,
+markets the same "no facial recognition" property explicitly as a
+privacy differentiator -- this repo has the same property for a
+different reason: wristband-based identity was already the simpler,
+more reliable design before privacy law was a consideration.)
+
+**On real-time audio coaching specifically:** a 2026-07-14 survey of
+open-source tooling turned up
+[`GetStream/Vision-Agents`](https://github.com/GetStream/Vision-Agents)
+(pip: `vision-agents`), an actively maintained, open-source framework
+purpose-built for exactly the row above -- real-time pose tracking + an
+LLM (Gemini Live, etc.) for live voice feedback over a low-latency WebRTC
+edge network, with a runnable gym-coach tutorial. It's a real, credible
+candidate for whoever builds irix-mvp-app's audio-coaching layer -- but
+deliberately **not** added as a dependency of *this* repo, for two
+reasons: (1) it would blur the boundary this section already draws
+("this repo doesn't generate spoken text or decide what to tell a
+member"), and (2) it's a heavy dependency graph shaped for a standalone
+real-time video/voice *service* (`aiortc`, `getstream`, `onnxruntime`,
+`fastapi`, `uvicorn`, MCP), not a lightweight library this repo's
+pipeline should embed. One concrete gotcha worth flagging for whoever
+does pick this up: `vision-agents` 0.6.6's core fails to import on Python
+3.10 (`vision_agents/core/observability/collector.py` does `from typing
+import Self`, which only exists in Python 3.11+) despite the package's
+own classifiers claiming 3.10 support -- verified by actually installing
+and importing it, not assumed. Needs Python 3.11+ in whatever service
+ends up using it.
+
 ## Wristband IMU-only rep counting (ported from a collaborator's prototype)
 
 `irix/fusion/imu_rep_counting.py` ports two published rep-counting
@@ -236,6 +279,26 @@ solve. That's the same rigor level the hobbyist projects above use; a
 per-station homography (four known reference points at install time)
 would remove the limitation and is a reasonable upgrade path, not
 attempted here.
+
+**Camera-tilt correction (added 2026-07-14, from VBT hardware
+precedent).** `CameraCalibration` now carries an optional
+`camera_tilt_deg` (default `0.0`, fully backward compatible) and a
+`pixels_to_vertical_m` conversion that `BarPathTracker.push` uses instead
+of the plain `pixels_to_m`. This borrows directly from GymAware -- the
+linear-position-transducer (LPT) considered the velocity-based-training
+gold standard -- which explicitly corrects for the angle between its
+cable and the bar's true vertical path, since a sensor not aligned with
+the true direction of motion foreshortens the observed distance for a
+given real displacement. A camera has the identical problem if it isn't
+mounted exactly perpendicular to the bar's vertical plane of travel
+(angled down to see a whole rack, or off to one side): the same real
+vertical displacement produces a smaller pixel delta than a level camera
+would see, so the *uncorrected* conversion underestimates true bar
+velocity. `camera_tilt_deg` is a first-order cosine correction for
+exactly that, set once per station at install time (e.g. off a
+level/inclinometer reading when the camera is mounted) -- same rigor
+level as the isotropic-scale simplification above, not a substitute for
+the full-homography upgrade path.
 
 **Tracking.** `irix/barbell/tracker.py`'s `BarPathTracker` buffers
 calibrated real-world vertical position over time and computes

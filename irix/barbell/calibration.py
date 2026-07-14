@@ -42,9 +42,31 @@ uses, and is reasonable given a station's limited working-distance range
 a full photogrammetric solve. A future upgrade path is a per-station
 homography computed at install time (four known floor/rack points),
 which would remove this limitation; out of scope for this scaffold.
+
+**Camera-tilt correction for vertical bar-path distance**, borrowed from
+real velocity-based-training hardware: GymAware -- the linear-position-
+transducer (LPT) considered the VBT gold standard -- explicitly corrects
+for the angle between its cable and the bar's true vertical path, since a
+sensor not perfectly aligned with the true direction of motion
+foreshortens the observed distance for a given real displacement. A
+camera has the same problem: if it isn't mounted with its optical axis
+exactly perpendicular to the bar's vertical plane of travel (angled down
+to see a whole rack, or off to one side), the same real vertical
+displacement produces a smaller vertical pixel delta than a level,
+perpendicular camera would see, so a raw pixel-to-mm conversion
+*underestimates* true vertical bar velocity. ``camera_tilt_deg`` on
+``CameraCalibration`` (default ``0.0``, i.e. no correction -- backward
+compatible) is a first-order cosine correction for exactly this, applied
+via ``pixels_to_vertical_m`` -- set once per station at install time
+(e.g. read off a level/inclinometer when the camera is mounted), not
+derived automatically. Same rigor level as the isotropic-scale
+simplification above: a planar approximation assuming tilt is the
+dominant source of foreshortening, not a substitute for the full-
+homography upgrade path already noted.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -70,10 +92,18 @@ WOMENS_OLYMPIC_BARBELL_WEIGHT_KG = 15.0
 class CameraCalibration:
     """A per-station px-per-mm scale factor, derived once (or refreshed
     periodically) from a detected reference object of known size.
+
+    ``camera_tilt_deg``: the angle (degrees) between this station's
+    camera's optical axis and true horizontal/perpendicular-to-bar-path --
+    see the module docstring's "camera-tilt correction" section. Defaults
+    to ``0.0`` (no correction), so every existing caller and every
+    pre-existing test is unaffected unless a station explicitly supplies
+    a measured tilt.
     """
 
     pixels_per_mm: float
     station_id: str
+    camera_tilt_deg: float = 0.0
 
     def pixels_to_mm(self, pixels: float) -> float:
         return pixels / self.pixels_per_mm
@@ -81,11 +111,22 @@ class CameraCalibration:
     def pixels_to_m(self, pixels: float) -> float:
         return self.pixels_to_mm(pixels) / 1000.0
 
+    def pixels_to_vertical_m(self, pixels: float) -> float:
+        """Like ``pixels_to_m``, but corrected for ``camera_tilt_deg`` --
+        use this (not ``pixels_to_m``) when converting a *vertical bar-path*
+        pixel delta to a real-world distance, since that's the measurement
+        a camera tilt actually foreshortens (see the module docstring).
+        Not appropriate for a lateral measurement like a plate's pixel
+        diameter, which ``pixels_to_m`` already handles correctly.
+        """
+        return self.pixels_to_m(pixels) / math.cos(math.radians(self.camera_tilt_deg))
+
 
 def calibrate_from_known_object(
     pixel_size: float,
     real_world_size_mm: float,
     station_id: str,
+    camera_tilt_deg: float = 0.0,
 ) -> CameraCalibration:
     """Derive a CameraCalibration from one detected reference measurement.
 
@@ -95,10 +136,18 @@ def calibrate_from_known_object(
     known real-world size (e.g. ``COMPETITION_BUMPER_PLATE_DIAMETER_MM``).
     Call this once per station at install time, or periodically re-derive
     it from fresh detections to catch camera/zoom drift.
+
+    ``camera_tilt_deg`` (default ``0.0``, no correction) is this station's
+    measured camera-mounting tilt -- see ``CameraCalibration.
+    pixels_to_vertical_m`` and the module docstring.
     """
     if pixel_size <= 0:
         raise ValueError("pixel_size must be positive")
-    return CameraCalibration(pixels_per_mm=pixel_size / real_world_size_mm, station_id=station_id)
+    return CameraCalibration(
+        pixels_per_mm=pixel_size / real_world_size_mm,
+        station_id=station_id,
+        camera_tilt_deg=camera_tilt_deg,
+    )
 
 
 def undistort_frame(frame: np.ndarray, camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> np.ndarray:

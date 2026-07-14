@@ -59,6 +59,7 @@ class RepSession:
         weight_check_every_n_frames: int = 30,
         barbell_detector: Optional[FreeWeightDetector] = None,
         rest_gap_s: float = 20.0,
+        camera_tilt_deg: float = 0.0,
     ):
         if exercise_name not in EXERCISES:
             raise ValueError(f"Unknown exercise {exercise_name!r} -- choices: {sorted(EXERCISES)}")
@@ -68,6 +69,7 @@ class RepSession:
         self.station_id = station_id
         self.weight_check_every_n_frames = weight_check_every_n_frames
         self.barbell_detector = barbell_detector
+        self.camera_tilt_deg = camera_tilt_deg
 
         self.counter = RepCounter(self.exercise)
         self.form_scorer = FormScorer()
@@ -143,7 +145,8 @@ class RepSession:
                 plate = FreeWeightDetector.largest_plate(detections)
                 if plate is not None:
                     calibration = calibrate_from_known_object(
-                        plate.pixel_diameter, COMPETITION_BUMPER_PLATE_DIAMETER_MM, self.station_id
+                        plate.pixel_diameter, COMPETITION_BUMPER_PLATE_DIAMETER_MM, self.station_id,
+                        camera_tilt_deg=self.camera_tilt_deg,
                     )
                     self.bar_tracker = BarPathTracker(calibration)
             if self.bar_tracker is not None:
