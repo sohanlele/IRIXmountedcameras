@@ -32,12 +32,23 @@ Example:
     python -m irix.demo.run_demo --mock-pose --exercise squat --with-barbell-tracking
     python -m irix.demo.run_demo --mock-pose --exercise leg_press
     python -m irix.demo.run_demo --source 0 --exercise bicep_curl
+
+--with-form-scoring (mock mode only, squat/bicep_curl -- the two
+exercises the synthetic pose generator supports) additionally runs a
+synthetic full-body keypoint stream through irix.form.scoring.FormScorer,
+populating each RepCompletedEvent's form_score/form_faults fields.
+--inject-form-fault lets the mock stream deliberately produce bad form
+(knee_valgus / leaning_back / elbow_drift) so the demo can show a fault
+actually getting caught, rather than only ever showing clean reps. In
+live mode (--source), form scoring runs automatically whenever the real
+PoseEstimator returns a confident pose, no flag needed -- see run_live.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 import time
+from typing import Optional
 
 from ..barbell.calibration import calibrate_from_known_object, COMPETITION_BUMPER_PLATE_DIAMETER_MM
 from ..barbell.rpe import RPETracker
@@ -47,7 +58,9 @@ from ..pipeline.cloud_sync import InMemoryCloudSync
 from ..pipeline.edge_buffer import LocalBuffer
 from ..pipeline.events import BandPlacementTracker
 from ..pipeline.schema import RepCompletedEvent, SetCompleteEvent
+from ..form.scoring import FormScorer
 from ..pose.geometry import joint_angle
+from ..pose.estimator import PersonPose
 from ..rep_counting.exercises import EXERCISES
 from ..rep_counting.state_machine import RepCounter
 
@@ -81,8 +94,10 @@ def run_mock(
     verbose: bool = True,
     with_imu_crosscheck: bool = False,
     with_barbell_tracking: bool = False,
+    with_form_scoring: bool = False,
+    inject_form_fault: Optional[str] = None,
 ):
-    from .mock_pose import synthetic_angle_stream, synthetic_bar_pixel_stream
+    from .mock_pose import synthetic_angle_stream, synthetic_bar_pixel_stream, synthetic_pose_stream
 
     exercise = EXERCISES[exercise_name]
     counter = RepCounter(exercise)
@@ -122,12 +137,29 @@ def run_mock(
             amplitude_px=90.0, velocity_decay_per_rep=0.08,
         )
 
-    for t, angle in synthetic_angle_stream(exercise, n_frames=n_frames, fps=fps, reps_per_second=reps_per_second):
+    form_scorer = FormScorer() if with_form_scoring else None
+    pose_stream = None
+    if with_form_scoring:
+        pose_stream = synthetic_pose_stream(
+            exercise, n_frames=n_frames, fps=fps, reps_per_second=reps_per_second,
+            inject_fault=inject_form_fault,
+        )
+
+    angle_stream = synthetic_angle_stream(exercise, n_frames=n_frames, fps=fps, reps_per_second=reps_per_second)
+    for t, angle in angle_stream:
+        pose = None
+        if pose_stream is not None:
+            # synthetic_pose_stream computes its own angle from the same
+            # tempo/exercise, in lockstep with angle_stream -- discard its
+            # angle and reuse the one from synthetic_angle_stream so the
+            # rep-counting angle source stays single-sourced regardless of
+            # which optional streams are enabled.
+            _, _, pose = next(pose_stream)
         if bar_tracker is not None:
             _, y_px = next(bar_stream)
             bar_tracker.push(t, y_px)
 
-        rep_event = counter.update(angle, timestamp=t)
+        rep_event = counter.update(angle, timestamp=t, pose=pose)
         if rep_event:
             camera_event = RepCompletedEvent(
                 member_id=member_id,
@@ -146,6 +178,11 @@ def run_mock(
                     rpe = rpe_tracker.estimate(bar_velocity.mean_velocity_m_s)
                     camera_event.velocity_loss_pct = rpe.velocity_loss_pct
                     camera_event.estimated_rpe = rpe.estimated_rpe
+            if form_scorer is not None:
+                assessment = form_scorer.score_rep(exercise_name, rep_event.poses)
+                if assessment is not None:
+                    camera_event.form_score = assessment.score
+                    camera_event.form_faults = assessment.faults
             buffer.push(camera_event)
             if verbose:
                 print(f"[{t:6.2f}s] [event] {camera_event.to_dict()}")
@@ -182,6 +219,12 @@ def run_live(source: str, exercise_name: str, member_id: str, station_id: str):
     aggregator = Aggregator(cloud_sync=cloud)
     aggregator.register_zone("zone-live", buffer)
     estimator = PoseEstimator()
+    # Form scoring runs "for free" in live mode -- RepCounter already
+    # buffers whatever PersonPose is passed into update(), and the real
+    # PoseEstimator gives us a full-body pose every frame (unlike the
+    # mock-pose synthetic angle stream, which needs the separate
+    # synthetic_pose_stream + --with-form-scoring opt-in above).
+    form_scorer = FormScorer()
 
     cap_source = int(source) if source.isdigit() else source
     cap = cv2.VideoCapture(cap_source)
@@ -201,7 +244,7 @@ def run_live(source: str, exercise_name: str, member_id: str, station_id: str):
                 a, v, c = person.xy(a_name), person.xy(v_name), person.xy(c_name)
                 if a is not None and v is not None and c is not None:
                     angle = joint_angle(a, v, c)
-                    rep_event = counter.update(angle, timestamp=time.monotonic())
+                    rep_event = counter.update(angle, timestamp=time.monotonic(), pose=person)
                     if rep_event:
                         camera_event = RepCompletedEvent(
                             member_id=member_id,
@@ -212,6 +255,10 @@ def run_live(source: str, exercise_name: str, member_id: str, station_id: str):
                             peak_velocity_deg_s=rep_event.peak_angular_velocity_deg_s,
                             mean_velocity_deg_s=rep_event.mean_angular_velocity_deg_s,
                         )
+                        assessment = form_scorer.score_rep(exercise_name, rep_event.poses)
+                        if assessment is not None:
+                            camera_event.form_score = assessment.score
+                            camera_event.form_faults = assessment.faults
                         buffer.push(camera_event)
                         print(f"[event] {camera_event.to_dict()}")
                     cv2.putText(
@@ -245,6 +292,16 @@ def main():
         help="(--mock-pose only) also run a synthetic barbell-pixel stream through irix.barbell for "
              "calibrated m/s velocity, velocity-loss %%, and estimated RPE.",
     )
+    parser.add_argument(
+        "--with-form-scoring", action="store_true",
+        help="(--mock-pose only, squat/bicep_curl) also run a synthetic full-body pose stream through "
+             "irix.form.scoring.FormScorer, populating form_score/form_faults.",
+    )
+    parser.add_argument(
+        "--inject-form-fault", default=None, choices=["knee_valgus", "leaning_back", "elbow_drift"],
+        help="(--with-form-scoring only) deliberately inject bad form into the synthetic pose stream "
+             "so the demo shows a fault actually getting caught.",
+    )
     args = parser.parse_args()
 
     if args.mock_pose:
@@ -252,6 +309,8 @@ def main():
             args.exercise, args.member_id, args.station_id, args.frames,
             with_imu_crosscheck=args.with_imu_crosscheck,
             with_barbell_tracking=args.with_barbell_tracking,
+            with_form_scoring=args.with_form_scoring,
+            inject_form_fault=args.inject_form_fault,
         )
     else:
         run_live(args.source, args.exercise, args.member_id, args.station_id)

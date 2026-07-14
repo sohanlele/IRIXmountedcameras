@@ -213,6 +213,149 @@ with rep-over-rep amplitude decay, so `velocity_loss_pct` and
 `estimated_rpe` both show a visible fatigue trend across a set without
 needing a camera.
 
+## Form scoring: rule-based fault detection (populating a field that's existed since the first commit and never been filled in)
+
+`RepCompletedEvent.form_score` (`irix/pipeline/schema.py`) has been in
+the schema since this repo's very first commit, with the comment "0-1,
+None if not yet scored" -- and until now, nothing anywhere in this repo
+ever scored a rep. Prompted to search broadly for prior art beyond
+velocity/RPE ("search online for anything ppl have built for a similar
+camera system for gym tracking, incorporate as much as makes sense"),
+this is the most direct gap several existing open-source projects target
+head-on:
+
+- **github.com/chrisprasanna/Exercise_Recognition_AI** lists, verbatim,
+  on its roadmap: "detect poor form (e.g., leaning, fast eccentric
+  motion, knees caving in, poor squat depth)". That's close to a
+  ready-made spec for exactly this field.
+- **github.com/NgoQuocBao1010/Exercise-Correction** trains one classifier
+  per exercise *per fault* (bicep curl "lean back" error, lunge "knee
+  over toe" error, squat "stage"/depth, plank "all errors") rather than
+  one generic form model -- confirmation that per-exercise, per-fault
+  scoring is the right granularity, not a single opaque "form" number.
+- **github.com/SravB/Computer-Vision-Weightlifting-Coach** scores deadlift
+  posture continuously in `[0, 1]` from OpenPose joint positions -- the
+  same output shape `form_score` already had.
+- **github.com/RiccardoRiccio/Fitness-AI-Trainer-With-Automatic-Exercise-Recognition-and-Counting**
+  and chrisprasanna's project both do their form/exercise judgments via
+  trained LSTM/BiLSTM models over joint-angle sequences rather than
+  hand-written geometric rules. Deliberately **not** the approach taken
+  here (see below).
+
+### Why rules instead of a trained classifier
+
+Every other module in this repo that touches pose data
+(`irix.rep_counting`, `irix.barbell.rpe`) is pure joint-angle/keypoint
+geometry: no training data, no model weights, fully unit-testable with
+synthetic fixtures, runs identically in CI as on an edge box.
+`irix/form/rules.py` follows the same pattern rather than introducing
+this repo's first trained-model dependency: each fault is a direct
+geometric check over the `PersonPose` keypoints buffered during a rep
+(see "wiring" below), not a classifier's opaque judgment. This trades
+away whatever a trained model could pick up that a human wouldn't think
+to encode as a rule, in exchange for every fault being explainable ("your
+knee shifted 0.31 shank-lengths inward at the bottom of the rep") and
+gradeable/testable without a labeled video dataset -- which this project
+doesn't have. If a labeled dataset materializes later, the LSTM approach
+in the two cited repos is the natural fallback to reach for.
+
+### The five checks (`irix/form/rules.py`)
+
+| exercise(s) | fault code | geometric definition |
+|---|---|---|
+| squat, leg_press, hack_squat | `insufficient_depth` | the rep's minimum hip-knee-ankle angle never got within ~8deg of the exercise's own configured `bottom_angle` (`irix.rep_counting.exercises`) -- reuses the exact threshold that already defines "bottom" for rep counting, rather than a second hardcoded number |
+| squat, leg_press, hack_squat | `knee_valgus` | knee's horizontal offset from the ankle (normalized by shank length) shifts more than 0.25 shank-lengths from the rep's own standing baseline -- "knee caving in", chrisprasanna's and NgoQuocBao1010's namesake fault |
+| bicep_curl | `leaning_back` | torso (hip->shoulder) angle from vertical deviates more than 15deg from the rep's own standing baseline -- classic momentum-cheat curl, NgoQuocBao1010's "lean back error" |
+| bicep_curl | `elbow_drift` | elbow's horizontal offset from the hip (normalized by upper-arm length) shifts more than 0.35 upper-arm-lengths from baseline -- elbow swinging away from the torso recruits the shoulder instead of isolating the bicep |
+| deadlift | `hips_rising_before_chest` | hip's and shoulder's vertical trajectories, each normalized to a 0 (bottom)-1 (lockout) progress scale over the rep, diverge by more than 0.25 -- the hips shoot up before the chest rises ("stripper deadlift"), a standard deadlift coaching cue, shifting load off the legs and rounding the lower back |
+
+Every check requires a minimum number of confidently-tracked keypoint
+samples (`MIN_VALID_SAMPLES = 3`, keypoint confidence >= 0.3) before it
+will report anything at all -- "couldn't assess" returns `None`, same as
+an unscored rep, rather than quietly reporting a perfect score when the
+data just wasn't there. `FormScorer.score_rep()` (`irix/form/scoring.py`)
+runs an exercise's registered checks, turns each detected fault into a
+score penalty (`FormAssessment.score`), and lists the triggered fault
+codes (`FormAssessment.faults`) -- structured codes like
+`"knee_valgus"`, not sentences, matching this event family's existing
+"no coaching text originates in this repo" boundary with irix-mvp-app;
+the app decides how to phrase it to the member.
+
+`bench_press` has no registered checks yet: a meaningful bench fault
+(elbow flare relative to the bar path) needs either a second camera angle
+or the barbell-tracking data from `irix.barbell` wired in, neither of
+which this scaffold does -- `form_score` correctly stays `None` for
+bench_press rather than reporting a number that isn't actually measuring
+anything.
+
+**Note on the camera geometry these checks assume**: the horizontal
+(x-axis) keypoint shifts `knee_valgus`/`leaning_back`/`elbow_drift` key
+off are a frontal-plane *proxy* seen from the same 30-45deg-off-axis
+camera angle assumed everywhere else in this repo (Section 3.1) -- a real
+inward knee collapse or backward lean will show up as a larger x-shift
+than clean form, but the magnitude isn't a calibrated angle the way a
+straight-on frontal camera would give. Same tier-2-proxy honesty already
+applied to `peak_angular_velocity_deg_s` elsewhere in this repo.
+
+### Wiring: `RepCounter` now optionally buffers poses, not just angles
+
+`RepCounter.update()` (`irix/rep_counting/state_machine.py`) gained an
+optional third argument, `pose: Optional[PersonPose] = None`. When a
+caller passes one, every pose seen from just after the previous rep's
+completion through this rep's completion is buffered and attached to the
+completed `RepEvent.poses` -- the *full* eccentric+concentric cycle, not
+just the concentric-phase window `peak_angular_velocity_deg_s` uses,
+since a fault like `leaning_back` can show up on the way down just as
+easily as on the way up. If a caller never passes a pose (e.g. an
+IMU-only path, or a frame where `PoseEstimator` wasn't confident enough
+to return keypoints), `RepEvent.poses` is `None` and `FormScorer` simply
+doesn't score that rep -- this class stays agnostic of form scoring
+itself, it just optionally carries the data. The buffer resets (not just
+after a completed rep, but also when the angle idles in the "top" zone
+without ever reaching bottom) so a lifter standing between sets for a
+while doesn't grow it unboundedly.
+
+`irix/demo/run_demo.py --with-form-scoring` (mock mode, squat/bicep_curl
+only -- see below) and `run_live` (real camera, any exercise, no flag
+needed -- it already gets a full pose from `PoseEstimator` every frame)
+both wire `FormScorer` in and populate
+`RepCompletedEvent.form_score`/`form_faults` from it.
+
+### Demo: a synthetic full-body pose stream, not just a synthetic angle
+
+The existing mock demo (`synthetic_angle_stream`) only ever produced a
+single oscillating angle, not full keypoints -- fine for rep counting,
+useless for form scoring, which needs multiple joints' positions, not
+just the one tracked angle. `irix/demo/mock_pose.py` adds
+`synthetic_pose_stream`, built on a small general-purpose 2-segment
+inverse-kinematics helper (`_third_point`): given two known keypoints and
+a target joint angle, place the third keypoint so
+`irix.pose.geometry.joint_angle` recovers exactly that angle. This keeps
+the synthetic pose stream and the synthetic angle stream mathematically
+consistent (same angle, geometrically real keypoints) rather than being
+two independent, potentially-contradictory fakes. It supports the squat
+family (hip-knee-ankle, ankle fixed) and bicep_curl (shoulder-elbow-wrist,
+hip fixed) -- not deadlift, which needs different geometry (a translating
+body, not an articulation around one fixed base joint) this generator
+doesn't build; requesting it for deadlift yields no pose rather than
+silently feeding `FormScorer` nonsense keypoints.
+
+`--inject-form-fault {knee_valgus,leaning_back,elbow_drift}` perturbs the
+relevant keypoint independently of the tracked joint angle (so rep
+counting stays unaffected) so the demo can show a fault actually getting
+caught, not just clean reps:
+
+```
+python -m irix.demo.run_demo --mock-pose --exercise squat --with-form-scoring --inject-form-fault knee_valgus
+python -m irix.demo.run_demo --mock-pose --exercise bicep_curl --with-form-scoring --inject-form-fault leaning_back
+```
+
+`tests/test_form_scoring.py` unit-tests all five checks in isolation
+(clean + faulted fixtures, plus insufficient-data returns `None`) using
+hand-built `PersonPose` fixtures independent of the demo's synthetic
+stream; `tests/test_rep_counting.py` and `tests/test_demo_smoke.py` cover
+the pose-buffering wiring and the end-to-end demo path respectively.
+
 ## Ankle placement for machine leg exercises
 
 The design doc calls out leg press / hack squat as the case where wrist-IMU

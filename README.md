@@ -56,6 +56,20 @@ estimated RPE -- squat/bench_press/deadlift have published velocity anchors):
 python -m irix.demo.run_demo --mock-pose --exercise squat --with-barbell-tracking
 ```
 
+With rule-based form scoring (squat/bicep_curl -- see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full fault list and
+the prior-art it's grounded in), optionally injecting a specific fault so
+the demo shows one actually getting caught:
+
+```bash
+python -m irix.demo.run_demo --mock-pose --exercise squat --with-form-scoring
+python -m irix.demo.run_demo --mock-pose --exercise squat --with-form-scoring --inject-form-fault knee_valgus
+python -m irix.demo.run_demo --mock-pose --exercise bicep_curl --with-form-scoring --inject-form-fault leaning_back
+```
+
+Live mode (`--source`) scores form automatically, no flag needed -- it
+already gets a full pose from `PoseEstimator` every frame.
+
 ## Test
 
 ```bash
@@ -67,7 +81,8 @@ pytest
 ```
 irix/
   pose/              pose estimation (YOLO-Pose wrapper) + joint-angle geometry
-  rep_counting/       joint-angle state machine + per-exercise configs; each rep carries duration + peak/mean velocity for fatigue tracking
+  rep_counting/       joint-angle state machine + per-exercise configs; each rep carries duration + peak/mean velocity for fatigue tracking, and optionally the buffered poses for form scoring
+  form/               rule-based per-rep fault detection (knee valgus, insufficient depth, leaning back, elbow drift, hips-rising-before-chest), populates RepCompletedEvent.form_score/form_faults
   fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters
   barbell/             self-calibrated (no environment edits) barbell/plate/dumbbell tracking, m/s bar velocity, RPE/velocity-loss estimation
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)

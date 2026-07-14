@@ -10,11 +10,18 @@ classify "a rep happened" from raw pixels.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Tuple
 
+from ..pose.estimator import PersonPose
 from .exercises import ExerciseConfig
+
+# Soft cap on how many poses accumulate in a rep's pose buffer -- guards
+# against unbounded growth if a caller keeps calling update() with a pose
+# while the lifter is idle at the top for a long time between sets
+# (handled explicitly below too; this is just a backstop).
+_MAX_BUFFERED_POSES = 600
 
 
 class RepState(Enum):
@@ -46,6 +53,13 @@ class RepEvent:
     # rather than approximating it from duration_s (which spans the whole
     # previous-rep-to-this-rep gap, not just the concentric phase).
     concentric_start_timestamp: Optional[float] = None
+    # Every PersonPose sample seen from (just after) the previous rep's
+    # completion through this rep's completion -- the full eccentric +
+    # concentric cycle, not just the concentric window above. Feeds
+    # irix.form.scoring.FormScorer. None if the caller never passed a
+    # ``pose`` into update() (e.g. IMU-only or angle-only callers, or the
+    # PoseEstimator wasn't confident enough to yield keypoints that frame).
+    poses: Optional[List[PersonPose]] = None
 
 
 def _phase_velocity(samples: List[Tuple[float, float]]) -> Tuple[Optional[float], Optional[float]]:
@@ -77,6 +91,11 @@ class RepCounter:
     is what feeds fatigue trend tracking (e.g. velocity loss across a set)
     on the irix-mvp-app side; this repo only supplies the numbers, not the
     fatigue judgment itself.
+
+    If callers also pass a ``pose`` into ``update()``, the full rep cycle's
+    poses are buffered separately (see ``RepEvent.poses``) for
+    ``irix.form.scoring.FormScorer`` to score after the fact -- this class
+    stays agnostic of form scoring itself, it just carries the data.
     """
 
     def __init__(self, exercise: ExerciseConfig):
@@ -93,12 +112,15 @@ class RepCounter:
         self._session_start: Optional[float] = None
         self._reached_bottom = False
         self._concentric_samples: List[Tuple[float, float]] = []
+        self._pose_samples: List[PersonPose] = []
 
     def _descending_is_decreasing(self) -> bool:
         """True if moving from top -> bottom means the angle is decreasing."""
         return self.exercise.top_angle > self.exercise.bottom_angle
 
-    def update(self, angle: float, timestamp: Optional[float] = None) -> Optional[RepEvent]:
+    def update(
+        self, angle: float, timestamp: Optional[float] = None, pose: Optional[PersonPose] = None
+    ) -> Optional[RepEvent]:
         """Feed the latest joint angle in. Returns a RepEvent iff a rep just completed."""
         if angle != angle:  # NaN guard (occlusion / missed keypoint)
             return None
@@ -108,6 +130,9 @@ class RepCounter:
         cfg = self.exercise
         h = cfg.hysteresis
         descending_is_decreasing = self._descending_is_decreasing()
+
+        if pose is not None and len(self._pose_samples) < _MAX_BUFFERED_POSES:
+            self._pose_samples.append(pose)
 
         at_bottom = (angle <= cfg.bottom_angle + h) if descending_is_decreasing else (angle >= cfg.bottom_angle - h)
         at_top = (angle >= cfg.top_angle - h) if descending_is_decreasing else (angle <= cfg.top_angle + h)
@@ -125,6 +150,8 @@ class RepCounter:
                 concentric_start = self._concentric_samples[0][0]
                 peak_v, mean_v = _phase_velocity(self._concentric_samples)
                 self._concentric_samples = []
+                poses = self._pose_samples if self._pose_samples else None
+                self._pose_samples = []
 
                 self.rep_count += 1
                 duration = ts - (self._last_rep_time or self._session_start)
@@ -139,8 +166,14 @@ class RepCounter:
                     peak_angular_velocity_deg_s=peak_v,
                     mean_angular_velocity_deg_s=mean_v,
                     concentric_start_timestamp=concentric_start,
+                    poses=poses,
                 )
+            # Idle at the top (no bottom reached since the last rep, or
+            # ever): nothing to report, and no reason to keep accumulating
+            # poses indefinitely while someone just stands there between
+            # sets.
             self.state = RepState.TOP
+            self._pose_samples = []
             return None
 
         # Between thresholds: keep buffering concentric-phase samples if

@@ -21,7 +21,7 @@ wristband-assigned member id.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 
 def _now() -> float:
@@ -56,6 +56,13 @@ class RepCompletedEvent:
     exercise: str
     rep_count: int
     form_score: Optional[float] = None  # 0-1, None if not yet scored
+    # Fault codes from irix.form.scoring.FormScorer, e.g. ["knee_valgus"].
+    # Structured tags, not sentences -- irix-mvp-app turns these into
+    # whatever copy its AI coach decides to say, matching the rest of
+    # this event family (see module docstring: no spoken text originates
+    # here). Empty list if scored clean or not scored at all; check
+    # form_score is not None to tell "clean" from "unscored".
+    form_faults: List[str] = field(default_factory=list)
     weight_kg: Optional[float] = None
     duration_s: Optional[float] = None  # time since the previous rep (tempo/cadence)
 
@@ -85,6 +92,7 @@ class RepCompletedEvent:
             "exercise": self.exercise,
             "rep_count": self.rep_count,
             "form_score": self.form_score,
+            "form_faults": self.form_faults,
             "weight_kg": self.weight_kg,
             "duration_s": self.duration_s,
             "peak_velocity_deg_s": self.peak_velocity_deg_s,

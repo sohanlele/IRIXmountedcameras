@@ -83,3 +83,51 @@ def test_faster_exercise_shows_higher_velocity_than_slower_one():
     # than a 0.5 reps/sec tempo -- a sanity check that duration_s actually
     # reflects tempo rather than being some constant.
     assert fast_curl_events[0].duration_s < squat_events[0].duration_s
+
+
+def test_update_without_pose_leaves_poses_none():
+    from irix.rep_counting.exercises import SQUAT
+    from irix.rep_counting.state_machine import RepCounter
+    from irix.demo.mock_pose import synthetic_angle_stream
+
+    counter = RepCounter(SQUAT)
+    events = []
+    for t, angle in synthetic_angle_stream(SQUAT, n_frames=300, fps=30.0, reps_per_second=0.5):
+        event = counter.update(angle, timestamp=t)  # no pose kwarg
+        if event:
+            events.append(event)
+    assert events
+    assert all(e.poses is None for e in events)
+
+
+def test_update_with_pose_buffers_full_rep_cycle():
+    from irix.rep_counting.exercises import SQUAT
+    from irix.rep_counting.state_machine import RepCounter
+    from irix.demo.mock_pose import synthetic_pose_stream
+
+    counter = RepCounter(SQUAT)
+    events = []
+    for t, angle, pose in synthetic_pose_stream(SQUAT, n_frames=300, fps=30.0, reps_per_second=0.5):
+        event = counter.update(angle, timestamp=t, pose=pose)
+        if event:
+            events.append(event)
+    assert len(events) >= 3
+    for e in events:
+        assert e.poses is not None
+        assert len(e.poses) > 1
+    # Each rep's pose buffer resets -- consecutive reps shouldn't share
+    # the exact same buffered list.
+    assert events[0].poses is not events[1].poses
+
+
+def test_pose_buffer_does_not_grow_unbounded_while_idle_at_top():
+    from irix.rep_counting.exercises import SQUAT
+    from irix.rep_counting.state_machine import RepCounter
+    from irix.pose.estimator import Keypoint, PersonPose
+
+    counter = RepCounter(SQUAT)
+    idle_pose = PersonPose(keypoints=[Keypoint(x=0.0, y=0.0, confidence=0.0)] * 17)
+    # Sit right at the top angle (idle between sets) for a long stretch.
+    for i in range(1000):
+        counter.update(SQUAT.top_angle, timestamp=float(i), pose=idle_pose)
+    assert len(counter._pose_samples) == 0
