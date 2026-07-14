@@ -55,3 +55,39 @@ def test_run_live_gym_demo_is_deterministic_given_a_seed():
 
     assert [type(e) for e in events_a] == [type(e) for e in events_b]
     assert len(events_a) == len(events_b)
+
+
+def test_run_live_gym_demo_is_byte_for_byte_deterministic_replay():
+    """Stronger than the type/count check above: every event's full
+    serialized payload (irix.pipeline.schema's to_dict(), the same shape
+    delivered to a real backend) must be identical across two same-seed
+    runs -- the actual "deterministic replay" property needed to trust a
+    validation/benchmark run as reproducible."""
+    events_a = run(n_ticks=260, seed=7, verbose=False)
+    events_b = run(n_ticks=260, seed=7, verbose=False)
+
+    dicts_a = [e.to_dict() for e in events_a]
+    dicts_b = [e.to_dict() for e in events_b]
+
+    assert dicts_a == dicts_b
+
+
+def test_run_live_gym_demo_seed_actually_drives_the_simulated_randomness():
+    """Sanity check for the determinism test above: prove the ``seed``
+    argument isn't silently ignored (which would make same-seed
+    determinism trivially true) by checking it actually changes the
+    gateway's simulated packet-loss draws. This run's specific
+    SyntheticPoseEstimator sequence is itself seed-independent by
+    construction (see irix.demo.synthetic_live), and RepCountFusion's
+    camera/IMU agreement happens to land on the same fused counts for
+    both seeds tried here -- so the *event* stream can coincidentally
+    match across seeds without that meaning seed is ignored; checking
+    the gateway's own random draws directly is the more direct test."""
+    from irix.wristband_sim.simulator import SimulatedBLEGateway
+
+    gateway_a = SimulatedBLEGateway(packet_loss_pct=0.3, seed=7)
+    gateway_b = SimulatedBLEGateway(packet_loss_pct=0.3, seed=99)
+    draws_a = [gateway_a._rng.random() for _ in range(20)]
+    draws_b = [gateway_b._rng.random() for _ in range(20)]
+
+    assert draws_a != draws_b

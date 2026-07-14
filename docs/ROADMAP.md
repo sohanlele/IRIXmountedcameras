@@ -23,10 +23,13 @@ checklist. Each item: current status, and what's left.
 5. **Track members as they move throughout the gym.** Real --
    `GymCoordinator`/`GymSessionRunner`, demonstrated end to end in
    `run_live_gym_demo.py` (a real `StationHandoffEvent`).
-6. **Detect exercises.** Partial -- exercise is configured per station
-   (`StationInfo.default_exercise`), not auto-classified from vision. No
-   `ExerciseDetected`/`ExerciseChanged` event exists yet (see
-   `docs/API_SPEC.md`).
+6. **Detect exercises.** Partial -- `irix.exercise_recognition` (added
+   Phase 2) can now classify which configured exercise a pose window
+   matches (or honestly report "unknown"/ambiguous), but it isn't wired
+   into session start yet -- `StationInfo.default_exercise` is still
+   what `RepSession` actually uses. No `ExerciseDetected`/
+   `ExerciseChanged` event exists yet (see `docs/API_SPEC.md`,
+   `docs/TODO.md`).
 7. **Count reps.** Real, camera+IMU fused.
 8. **Detect sets.** Real (`RestGapSetBoundaryDetector`, gap-inferred, not
    hand-scripted).
@@ -45,12 +48,17 @@ checklist. Each item: current status, and what's left.
     2026-07-14 -- `SimulatedBLEGateway.disconnect()`, demonstrated
     surviving a scripted dropout in `run_live_gym_demo.py`. Against real
     hardware: not started.
-15. **Generate benchmark reports.** Not started -- see
-    `docs/VALIDATION.md`'s recommended next steps.
+15. **Generate benchmark reports.** Real as of Phase 2 --
+    `python -m irix.benchmark.run_benchmarks` measures pose-tracker/
+    exercise-recognition/fusion/EKF/clock-sync timing, full live-pipeline
+    throughput, camera-reconnect schedule, BLE-disconnect-recovery
+    margin, CPU/memory -- honestly reports GPU/real-pose-inference FPS as
+    unavailable in this sandboxed (no CUDA/ultralytics) environment
+    rather than fabricating a number.
 16. **Generate validation reports.** Partial -- `docs/VALIDATION.md`
-    documents current test coverage and known gaps; no automated report
-    generation (e.g. a `pytest`-driven coverage/accuracy report artifact)
-    exists yet.
+    documents current test coverage and known gaps; benchmark reports
+    (above) now exist. Still no ground-truth accuracy report (needs real
+    labeled gym video -- see `docs/VALIDATION.md`).
 17. **Produce documentation explaining every subsystem.** Real as of
     2026-07-14 -- the full `docs/` suite this file is part of, plus the
     pre-existing `docs/ARCHITECTURE.md`.

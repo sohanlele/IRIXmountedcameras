@@ -34,17 +34,31 @@ class BandPlacementTracker:
     def current_placement(self) -> BandPlacement:
         return self._current
 
-    def event_for(self, exercise: ExerciseConfig) -> Optional[BandPlacementRequiredEvent]:
+    def event_for(
+        self, exercise: ExerciseConfig, timestamp: Optional[float] = None,
+    ) -> Optional[BandPlacementRequiredEvent]:
         """Call once when transitioning into `exercise`. Returns an event
-        if the band needs to move, else None."""
+        if the band needs to move, else None.
+
+        ``timestamp``: the actual transition time, when the caller has
+        one (e.g. a session's ``start_ts``) -- passed through to the
+        event instead of leaving it at the dataclass's wall-clock
+        default, so a deterministic-replay run doesn't leak real
+        wall-clock time into an otherwise fully-reproducible event
+        stream. ``None`` (default) preserves the old wall-clock-default
+        behavior for any existing caller that doesn't have a timestamp
+        to give."""
         if exercise.band_placement == self._current:
             return None
-        event = BandPlacementRequiredEvent(
+        kwargs = dict(
             member_id=self.member_id,
             exercise=exercise.name,
             from_placement=self._current.value,
             to_placement=exercise.band_placement.value,
         )
+        if timestamp is not None:
+            kwargs["timestamp"] = timestamp
+        event = BandPlacementRequiredEvent(**kwargs)
         self._current = exercise.band_placement
         return event
 

@@ -184,13 +184,14 @@ class StationSessionRunner:
             if r.wristband_id is not None and self.checkout_registry.is_checked_out(r.wristband_id)
         })
 
-    def _start_session(self, wristband_id: str) -> None:
+    def _start_session(self, wristband_id: str, now: float) -> None:
         member_id = self.checkout_registry.resolve_member(wristband_id)
         assert member_id is not None  # guaranteed by callers checking is_checked_out first
         session = RepSession(
             exercise_name=self.exercise_name,
             member_id=member_id,
             station_id=self.station_id,
+            start_ts=now,
             **self._session_kwargs,
         )
         self._on_events(session.initial_events)
@@ -245,7 +246,7 @@ class StationSessionRunner:
         for wristband_id in present_wristband_ids:
             self._last_seen[wristband_id] = now
             if wristband_id not in self._sessions:
-                self._start_session(wristband_id)
+                self._start_session(wristband_id, now)
 
         if not self._sessions:
             return

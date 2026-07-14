@@ -139,3 +139,60 @@ def test_gateway_move_to_station_none_removes_from_readings():
     gateway.move_to_station("band-1", None)
     gateway.tick(now=0.1)
     assert gateway.ble_reader() == []
+
+
+def test_clock_drift_advances_timestamps_faster_than_true_elapsed_time():
+    """A positive clock_drift_ppm simulates a wristband crystal running
+    fast -- its reported IMUSample timestamps should outrun true elapsed
+    (gateway) time by exactly that ppm rate."""
+    true_drift_ppm = 200.0  # within BLE's spec-allowed sleep-clock range
+    band = SimulatedWristband("band-1", sample_rate_hz=100.0, clock_drift_ppm=true_drift_ppm, seed=0)
+    band.set_motion("idle")
+
+    true_elapsed_s = 100.0
+    samples = band.advance(dt=true_elapsed_s)
+
+    reported_elapsed_s = samples[-1].timestamp
+    expected_reported = true_elapsed_s * (1.0 + true_drift_ppm / 1e6)
+    assert reported_elapsed_s == pytest.approx(expected_reported, rel=1e-3)
+    assert reported_elapsed_s > true_elapsed_s  # genuinely drifted ahead
+
+
+def test_zero_clock_drift_matches_true_elapsed_time():
+    band = SimulatedWristband("band-1", sample_rate_hz=100.0, clock_drift_ppm=0.0, seed=0)
+    band.set_motion("idle")
+    samples = band.advance(dt=50.0)
+    assert samples[-1].timestamp == pytest.approx(50.0, abs=0.02)
+
+
+def test_negative_clock_drift_lags_true_elapsed_time():
+    band = SimulatedWristband("band-1", sample_rate_hz=100.0, clock_drift_ppm=-150.0, seed=0)
+    band.set_motion("idle")
+    samples = band.advance(dt=100.0)
+    assert samples[-1].timestamp < 100.0
+
+
+def test_clock_sync_estimator_recovers_simulated_wristband_drift():
+    """Ties irix.fusion.clock_sync to irix.wristband_sim: simulate a
+    wristband with known drift, sample its reported-vs-true offset at
+    several checkpoints (as if a real deployment periodically compared
+    the band's timestamps against a trusted reference), and confirm
+    ClockSyncEstimator recovers the configured drift rate."""
+    from irix.fusion.clock_sync import ClockSyncEstimator
+
+    true_drift_ppm = 180.0
+    band = SimulatedWristband("band-1", sample_rate_hz=100.0, clock_drift_ppm=true_drift_ppm, seed=0)
+    band.set_motion("idle")
+
+    estimator = ClockSyncEstimator(min_confidence=0.0)
+    checkpoint_interval_s = 20.0
+    for _ in range(6):
+        samples = band.advance(dt=checkpoint_interval_s)
+        true_time = band._t / (1.0 + true_drift_ppm / 1e6)  # what a trusted reference clock would read
+        reported_time = samples[-1].timestamp
+        offset = reported_time - true_time
+        estimator.add_observation(at_time=true_time, offset_s=offset, confidence=1.0)
+
+    result = estimator.estimate()
+
+    assert result.drift_ppm == pytest.approx(true_drift_ppm, rel=0.05)

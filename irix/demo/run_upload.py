@@ -105,6 +105,7 @@ def run_upload(
         weight_check_every_n_frames=weight_check_every_n_frames,
         barbell_detector=barbell_detector,
         rest_gap_s=rest_gap_s,
+        start_ts=0.0,  # frame 0's timestamp, matches this function's frame_index/fps convention
     )
     if imu_path:
         session.add_imu_samples(load_imu_samples(imu_path))

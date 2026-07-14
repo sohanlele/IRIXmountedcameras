@@ -61,6 +61,7 @@ class RepSession:
         rest_gap_s: float = 20.0,
         camera_tilt_deg: float = 0.0,
         camera_tilt_deg_by_camera: Optional[Dict[str, float]] = None,
+        start_ts: Optional[float] = None,
     ):
         """``camera_tilt_deg``: the tilt correction to use for whichever
         camera's frames arrive without a more specific entry in
@@ -78,6 +79,17 @@ class RepSession:
         for all of them. See ``process_frame``'s ``camera_id`` parameter
         and this class's bar-tracking block for how this feeds into
         per-camera self-calibration.
+
+        ``start_ts``: the timestamp this session actually started at
+        (e.g. the live caller's ``now``, or an uploaded file's frame-0
+        timestamp) -- used only for ``initial_events``' timestamp
+        (currently just a possible ``BandPlacementRequiredEvent``).
+        Defaults to ``None``, which leaves that event's timestamp at its
+        dataclass default (wall-clock ``time.monotonic()`` at
+        construction) for backward compatibility with any existing
+        caller that doesn't supply one; a caller that cares about
+        deterministic replay (``irix.demo.run_live_gym_demo``,
+        ``irix.live.station_runner``) should supply it.
         """
         if exercise_name not in EXERCISES:
             raise ValueError(f"Unknown exercise {exercise_name!r} -- choices: {sorted(EXERCISES)}")
@@ -117,7 +129,7 @@ class RepSession:
         self._frame_count = 0
 
         self.initial_events: List[CameraEvent] = []
-        band_event = self.band_tracker.event_for(self.exercise)
+        band_event = self.band_tracker.event_for(self.exercise, timestamp=start_ts)
         if band_event is not None:
             self.initial_events.append(band_event)
 
@@ -185,6 +197,7 @@ class RepSession:
                         confidence=reading.confidence,
                         geometry_consistent=geometry_consistent,
                         geometry_check_reason=geometry_reason,
+                        timestamp=ts,  # this frame's own timestamp, not wall-clock
                     )
                 )
 
@@ -251,6 +264,11 @@ class RepSession:
             peak_velocity_deg_s=rep_event.peak_angular_velocity_deg_s,
             mean_velocity_deg_s=rep_event.mean_angular_velocity_deg_s,
             weight_kg=self._current_weight_kg,
+            # rep_event.timestamp, not the dataclass's wall-clock default --
+            # this is the actual detected-rep time (deterministic under replay
+            # for run_upload's frame_index/fps timestamps or a live caller's
+            # injected clock), see docs/VALIDATION.md on deterministic replay.
+            timestamp=rep_event.timestamp,
         )
         assessment = self.form_scorer.score_rep(self.exercise_name, rep_event.poses)
         if assessment is not None:
@@ -311,6 +329,7 @@ class RepSession:
                 fused_rep_count=fused.fused_count,
                 rep_count_agreement=fused.agreement,
                 rep_count_source=fused.source,
+                timestamp=end_ts,  # the set's actual close time, not wall-clock
             )
         )
         analysis = self.set_fatigue_analyzer.analyze(self.exercise_name, self._set_reps)
@@ -332,6 +351,7 @@ class RepSession:
                     set_to_set_velocity_trend_pct=trend[-1] if trend else None,
                     session_fatigue_index=summary.session_fatigue_index,
                     completed_sets_this_session=summary.completed_sets,
+                    timestamp=end_ts,  # same set-close time as SetCompleteEvent, not wall-clock
                 )
             )
         if self.rpe_tracker is not None:

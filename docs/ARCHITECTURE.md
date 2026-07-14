@@ -1390,3 +1390,111 @@ this document. What changes is that once real wristband hardware and its
 BLE protocol exist, wiring in a real `LiveBLEIMUStream` subclass and a
 real `ble_reader` is the *only* new work required -- everything else in
 the live path this simulator now exercises stays as-is.
+
+## Phase 2: tracking accuracy, exercise recognition, load detection, calibration, benchmarking (2026-07-14)
+
+Phase 1 built the software scaffold and validated it end-to-end
+(simulator, live orchestration, full docs). Phase 2's mandate was
+different: stop building infrastructure, spend real research time per
+subsystem, and improve production accuracy/robustness of the actual
+tracking system. Summary of what changed and why -- full reasoning lives
+in each module's own docstring; this is the index.
+
+- **`irix.pose.tracker`** -- intra-camera multi-person tracking.
+  `PersonPose.track_id` was documented (Phase 1) as "just that frame's
+  list index," not a stable identity. Researched SORT/ByteTrack/BoT-SORT;
+  adopted ByteTrack's two-stage high/low-confidence association (Zhang et
+  al., ECCV 2022) on top of a SORT-style constant-velocity Kalman filter
+  (Bewley et al., 2016), explicitly *not* adopting BoT-SORT's deep ReID
+  embedding -- unnecessary at gym-station scale (1-4 people, static
+  camera). `TrackedPoseEstimator` makes this an opt-in drop-in wrapper
+  around any pose estimator; not yet the default (see `docs/TODO.md`).
+
+- **`irix.exercise_recognition`** -- previously nonexistent; exercise
+  was (and still is, at session-start) only ever configured per station,
+  never classified. Researched ST-GCN/temporal-attention-GCN/pose
+  transformers and the one public camera+IMU fitness dataset (MM-Fit,
+  IMWUT 2020) built for exactly this problem shape -- and concluded
+  training a sequence model in this sandboxed, GPU-less environment
+  would produce an undertrained model worse than an honest baseline, not
+  better. Built a zero-training range-of-motion + periodicity classifier
+  instead, scored per candidate `ExerciseConfig`, with an explicit,
+  tested handling of the real structural ambiguity (squat/leg_press/
+  hack_squat share a joint triplet -- reported as `unknown`, not guessed).
+
+- **`irix.fusion.clock_sync`** -- camera/wristband clock offset + drift
+  estimation, previously entirely unmodeled (every fusion module assumed
+  a shared clock). Researched VINS-Fusion's online temporal calibration
+  and BLE's own clock-accuracy spec (±20 ppm main clock, ±250 ppm sleep
+  clock -- real numbers, cited in the module). Implemented cross-
+  correlation-based offset estimation plus a weighted linear drift fit,
+  validated against `irix.wristband_sim`'s new `clock_drift_ppm`
+  simulation (recovers a configured 180 ppm drift to within 5%). Not yet
+  wired into a live entry point (see `docs/TODO.md`).
+
+- **`RepCountFusion` packet-loss awareness** -- `imu_confidence` is now
+  discounted by measured sample completeness (actual vs. expected sample
+  count at the configured rate) before being compared against camera
+  confidence, so a fusion decision under heavy BLE packet loss correctly
+  leans back toward the camera instead of trusting a confidently-computed
+  count from a visibly incomplete signal.
+
+- **`irix.weight_recognition.plate_color_check`** -- classical HSV
+  color-blob detection against the IWF bumper-plate color standard
+  (confirmed via search: 10/15/20/25 kg = green/yellow/blue/red).
+  Independent of the still-untrained `FreeWeightDetector`; works today
+  for color-coded bumper plates, correctly finds nothing on
+  non-standard-colored gym iron (by design, not a gap). Never fabricates
+  a total: an odd plate count or no confident detections both return
+  `total_weight_kg=None` with a reason.
+
+- **`irix.pose.calibration`** -- the actual checkerboard intrinsic
+  (`cv2.calibrateCamera`) + extrinsic (`cv2.solvePnP`) calibration
+  workflow that `irix.pose.multiview.CameraProjection` and
+  `irix.barbell.calibration.undistort_frame` both previously assumed was
+  "out of scope here." Reprojection-error-based quality reporting,
+  `CalibrationProfile` save/load, plus a lighter-weight ground-plane
+  homography path for single-camera zone/position mapping.
+
+- **`irix.benchmark`** -- real timing/throughput measurements (pose
+  tracker, exercise recognition, fusion, EKF, clock sync, full simulated
+  live-pipeline throughput, camera-reconnect schedule, BLE-disconnect-
+  recovery margin, CPU/memory via stdlib `resource`) using only this
+  repo's existing dependencies. GPU utilization and real pose-inference
+  FPS auto-detect `ultralytics`/CUDA availability and report `None` with
+  a clear reason in this sandboxed environment rather than fabricate a
+  number -- they'll run for real the moment they're available.
+
+- **Deterministic-replay bug found and fixed.** Writing a byte-for-byte
+  event-replay test (`tests/test_run_live_gym_demo.py`) surfaced a real,
+  pre-existing correctness bug: `RepCompletedEvent`/`SetCompleteEvent`/
+  `SetFatigueSummaryEvent`/`WeightConfirmedEvent`/
+  `BandPlacementRequiredEvent` were all constructed without an explicit
+  `timestamp=`, silently falling back to `schema.py`'s dataclass default
+  (`time.monotonic()`, real wall-clock time) regardless of whatever
+  deterministic clock a caller had injected -- only `StationHandoffEvent`
+  got this right before now. Fixed by threading the actual
+  event-relevant timestamp (a rep's own detected time, a set's close
+  time, a frame's own timestamp, a session's `start_ts`) through every
+  construction site in `irix.pipeline.rep_session`/`irix.pipeline.events`.
+  This matters beyond just this phase's new tests: `run_upload.py` and
+  every live entry point were producing events with non-reproducible
+  timestamps before this fix, undermining any validation/benchmark run
+  that assumed replay determinism.
+
+- **Simulation expanded**: `irix.wristband_sim.simulator.SimulatedWristband`
+  gained `clock_drift_ppm` (a band's onboard clock now genuinely diverges
+  from true elapsed time at a configurable rate, matching real crystal-
+  oscillator behavior); a new multi-member stress test
+  (`tests/test_stress_multi_member.py`) verifies 8 concurrent members
+  across 4 stations, including a late-joining group, never cross-
+  attribute events; deterministic replay is now verified at the full
+  serialized-event-payload level, not just event type/count.
+
+**What Phase 2 deliberately did not do**, and why: no trained deep model
+for exercise/action recognition (see above -- would need real GPU
+training infra and labeled data this environment doesn't have); no
+deep-ReID tracking upgrade (unnecessary at this scale, see
+`irix/pose/tracker.py`); no Docker/Jetson deployment work (explicitly
+out of scope for this phase per the founding brief -- "the objective is
+no longer to improve infrastructure").

@@ -65,6 +65,7 @@ class SimulatedWristband:
         gyro_noise_std: float = 0.02,
         accel_bias=DEFAULT_ACCEL_BIAS,
         gyro_bias=DEFAULT_GYRO_BIAS,
+        clock_drift_ppm: float = 0.0,
         seed: int = 0,
     ):
         self.wristband_id = wristband_id
@@ -73,6 +74,17 @@ class SimulatedWristband:
         self.gyro_noise_std = gyro_noise_std
         self.accel_bias = np.asarray(accel_bias, dtype=float)
         self.gyro_bias = np.asarray(gyro_bias, dtype=float)
+        # This band's onboard crystal runs at (1 + clock_drift_ppm/1e6) times
+        # the gateway's "true" tick rate -- the same free-running-oscillator
+        # behavior a real wristband has (see irix.fusion.clock_sync's module
+        # docstring for the BLE spec drift numbers this should be set from:
+        # up to +/-20 ppm main clock, up to +/-250 ppm sleep clock). Both the
+        # *number* of samples generated per real-world dt and each sample's
+        # own timestamp advance at this drifted rate, so a wristband's
+        # reported timestamps genuinely diverge from true elapsed time over
+        # a session -- exactly what irix.fusion.clock_sync exists to detect
+        # and correct for.
+        self.clock_drift_ppm = clock_drift_ppm
         self.station_id: Optional[str] = None
 
         self._rng = np.random.default_rng(seed)
@@ -112,7 +124,15 @@ class SimulatedWristband:
         once per gateway tick (``dt`` = wall-clock time since the last
         tick) rather than each band free-running its own clock, so every
         band in a gateway stays in lockstep with one tick loop."""
-        n = max(0, int(round(dt * self.sample_rate_hz)))
+        # The wristband's own onboard clock advances by dt*(1+drift) while
+        # true (gateway/reference) time advances by dt -- so, at this
+        # band's *nominal* sample_rate_hz (a fixed property of its own
+        # clock), it produces slightly more or fewer samples per true-time
+        # tick than an undrifted band would, and each sample's own
+        # timestamp is spaced at 1/sample_rate_hz in the band's own
+        # (drifted) clock -- not the gateway's.
+        internal_dt = dt * (1.0 + self.clock_drift_ppm / 1e6)
+        n = max(0, int(round(internal_dt * self.sample_rate_hz)))
         samples = []
         for _ in range(n):
             self._t += 1.0 / self.sample_rate_hz

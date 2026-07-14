@@ -33,11 +33,28 @@ across a set) are used as a prior to constrain ``RecoFitCounter``'s
 period-bounds search, which the IMU-only crosscheck never had access to
 and which measurably narrows RecoFit's search space versus guessing
 generic 1-4s bounds blind.
+
+**Packet-loss awareness (Phase 2).** ``RecoFitCounter``/``ULiftCounter``'s
+own ``confidence`` reflects how clean/periodic *the samples they were
+given* look -- it has no way to know whether those samples are the whole
+set or a packet-loss-degraded fraction of it (``irix.wristband_sim``'s
+``packet_loss_pct`` can drop IMU packets same as a real radio would).
+A sparse-but-locally-clean-looking signal (e.g. every third packet lost,
+but the surviving ones still trace a plausible periodic shape) could
+otherwise report unjustified confidence. ``fuse()`` now discounts
+``imu_confidence`` by ``_sample_completeness`` -- the ratio of samples
+actually present to how many should exist at the expected sample rate
+over the set's observed time span -- before comparing it against the
+camera's confidence, so a fusion decision under heavy packet loss
+correctly leans back toward the camera rather than trusting a
+confidently-computed count over a visibly incomplete signal.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Sequence
+
+import numpy as np
 
 from ..fusion.imu import IMUSample
 from ..fusion.imu_rep_counting import RecoFitCounter, RepResult, ULiftCounter
@@ -56,6 +73,13 @@ class FusedSetRepCount:
     imu_confidence: Optional[float]
     imu_algorithm: Optional[str]  # "recofit" | "ulift", whichever fusion actually used
     imu_peak_timestamps: List[float] = field(default_factory=list)
+    # Fraction (0-1) of expected samples (at RepCountFusion's configured
+    # imu_sample_rate_hz) actually present over the set's observed IMU
+    # time span -- 1.0 for a complete stream, lower under packet loss.
+    # Surfaced (not just used internally) so a caller/ops dashboard can
+    # see *why* a fusion decision leaned toward the camera under heavy
+    # packet loss, not just that it did.
+    imu_sample_completeness: Optional[float] = None
     fused_count: int = 0
     agreement: bool = True
     source: FusionSource = "camera_only"
@@ -67,6 +91,7 @@ class FusedSetRepCount:
             "imu_count": self.imu_count,
             "imu_confidence": self.imu_confidence,
             "imu_algorithm": self.imu_algorithm,
+            "imu_sample_completeness": self.imu_sample_completeness,
             "fused_count": self.fused_count,
             "agreement": self.agreement,
             "source": self.source,
@@ -93,11 +118,25 @@ class RepCountFusion:
         min_imu_confidence: float = 0.35,
         default_min_period: float = 1.0,
         default_max_period: float = 4.0,
+        imu_sample_rate_hz: float = 100.0,
+        completeness_floor: float = 0.7,
     ):
         self.agreement_tolerance = agreement_tolerance
         self.min_imu_confidence = min_imu_confidence
         self.default_min_period = default_min_period
         self.default_max_period = default_max_period
+        # Expected wristband sample rate -- see irix.fusion.imu's module
+        # docstring ("100-200+ Hz"); irix.wristband_sim.simulator's
+        # default matches this. Only used to *measure* packet loss
+        # (actual vs. expected sample count), never to fabricate missing
+        # samples.
+        self.imu_sample_rate_hz = imu_sample_rate_hz
+        # Completeness at/above this fraction gets zero confidence
+        # discount -- ordinary packet loss (a real radio typically drops
+        # a small, tolerable fraction of packets even in good conditions)
+        # shouldn't discount a fusion decision at all; only meaningfully
+        # degraded streams below this floor should.
+        self.completeness_floor = completeness_floor
 
     def _period_bounds(self, camera_rep_durations: Sequence[float]) -> tuple:
         """Derive RecoFitCounter's period search bounds from the camera's
@@ -147,6 +186,8 @@ class RepCountFusion:
 
         period_bounds = self._period_bounds(camera_rep_durations)
         imu_result, algorithm = self._best_imu_result(imu_samples, period_bounds)
+        completeness = self._sample_completeness(imu_samples)
+        effective_imu_confidence = imu_result.confidence * min(1.0, completeness / self.completeness_floor)
 
         if imu_result.confidence <= 0.0 and imu_result.count == 0:
             # IMU signal unusable (e.g. band not worn, or too short/flat)
@@ -155,20 +196,39 @@ class RepCountFusion:
             return FusedSetRepCount(
                 camera_count=camera_count, camera_confidence=camera_confidence,
                 imu_count=None, imu_confidence=None, imu_algorithm=None,
+                imu_sample_completeness=completeness,
                 fused_count=camera_count, agreement=True, source="camera_only",
             )
 
         agree = abs(camera_count - imu_result.count) <= self.agreement_tolerance
         if agree:
             fused_count, source = camera_count, "camera_imu_agreement"
-        elif camera_confidence >= imu_result.confidence:
+        elif camera_confidence >= effective_imu_confidence:
             fused_count, source = camera_count, "camera_preferred_on_disagreement"
         else:
             fused_count, source = imu_result.count, "imu_preferred_on_disagreement"
 
         return FusedSetRepCount(
             camera_count=camera_count, camera_confidence=camera_confidence,
-            imu_count=imu_result.count, imu_confidence=imu_result.confidence,
+            imu_count=imu_result.count, imu_confidence=effective_imu_confidence,
             imu_algorithm=algorithm, imu_peak_timestamps=imu_result.peak_timestamps,
+            imu_sample_completeness=completeness,
             fused_count=fused_count, agreement=agree, source=source,
         )
+
+    def _sample_completeness(self, imu_samples: Sequence[IMUSample]) -> float:
+        """Fraction of expected samples (at ``imu_sample_rate_hz`` over
+        the observed span from the first to the last sample) actually
+        present -- 1.0 for a complete stream, lower under packet loss.
+        A single sample (zero span) can't measure a rate, so it's treated
+        as complete (nothing to discount against) rather than div-by-zero.
+        """
+        if len(imu_samples) < 2:
+            return 1.0
+        span = imu_samples[-1].timestamp - imu_samples[0].timestamp
+        if span <= 0:
+            return 1.0
+        expected = span * self.imu_sample_rate_hz
+        if expected <= 0:
+            return 1.0
+        return float(np.clip(len(imu_samples) / expected, 0.0, 1.0))
