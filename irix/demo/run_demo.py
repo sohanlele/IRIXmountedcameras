@@ -207,7 +207,34 @@ def run_mock(
     return counter, cloud
 
 
-def run_live(source: str, exercise_name: str, member_id: str, station_id: str):
+def run_live(
+    source: str, exercise_name: str, member_id: str, station_id: str,
+    display: bool = False, max_frames: Optional[int] = None,
+):
+    """Runs the real pipeline (PoseEstimator -> joint angle -> RepCounter
+    -> FormScorer -> structured events) against a real webcam or video
+    file.
+
+    ``display=False`` by default: a real station's edge box has no
+    monitor attached (Section 6.1's edge boxes sit on a shelf next to a
+    camera, not a desk), so a debug preview window is opt-in, not the
+    default. This matters beyond convenience -- ``opencv-python-headless``
+    (this repo's pinned dependency, since a "heavy" GUI-enabled OpenCV
+    build isn't appropriate for a headless edge box either) doesn't
+    actually implement ``cv2.imshow``'s backend; calling it unconditionally
+    crashes with "The function is not implemented" on any machine without
+    a GTK/Cocoa/Windows GUI toolkit installed -- which describes both this
+    kind of CI/sandbox environment *and* the real production deployment
+    target. ``--display`` is for a developer's own desktop machine with a
+    real display and a GUI-enabled OpenCV install; it deliberately fails
+    loudly with a clear message rather than crashing deep in an OpenCV
+    C++ exception if the environment can't actually show a window.
+
+    ``max_frames`` stops after N frames regardless of whether the source
+    has more -- used by the integration test to run against a short
+    synthetic video without needing `cap.read()` to naturally return
+    False (a live webcam source never does).
+    """
     import cv2
 
     from ..pose.estimator import PoseEstimator
@@ -233,11 +260,15 @@ def run_live(source: str, exercise_name: str, member_id: str, station_id: str):
         sys.exit(1)
 
     a_name, v_name, c_name = exercise.joint_triplet
+    frame_count = 0
     try:
         while True:
+            if max_frames is not None and frame_count >= max_frames:
+                break
             ok, frame = cap.read()
             if not ok:
                 break
+            frame_count += 1
             people = estimator.estimate(frame)
             if people:
                 person = people[0]
@@ -261,18 +292,36 @@ def run_live(source: str, exercise_name: str, member_id: str, station_id: str):
                             camera_event.form_faults = assessment.faults
                         buffer.push(camera_event)
                         print(f"[event] {camera_event.to_dict()}")
-                    cv2.putText(
-                        frame, f"Reps: {counter.rep_count}", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
+                    if display:
+                        cv2.putText(
+                            frame, f"Reps: {counter.rep_count}", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
+                        )
+            if display:
+                try:
+                    cv2.imshow("IRIX demo", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except cv2.error as exc:
+                    print(
+                        "--display requires a GUI-enabled OpenCV build and an actual "
+                        "display (this environment has neither -- e.g. opencv-python-headless, "
+                        "or a headless edge box/CI/sandbox). Re-run without --display, or "
+                        "`pip install opencv-python` (non-headless) on a machine with a "
+                        f"real display. Original error: {exc}",
+                        file=sys.stderr,
                     )
-            cv2.imshow("IRIX demo", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+                    break
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        if display:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass  # already reported the same underlying issue above when opening the window failed
         aggregator.sync()
         print(f"Total reps: {counter.rep_count}")
+    return counter, cloud
 
 
 def main():
@@ -302,6 +351,12 @@ def main():
         help="(--with-form-scoring only) deliberately inject bad form into the synthetic pose stream "
              "so the demo shows a fault actually getting caught.",
     )
+    parser.add_argument(
+        "--display", action="store_true",
+        help="(--source only) show a debug preview window. Off by default -- a real station's edge box "
+             "has no monitor attached, and opencv-python-headless (this repo's pinned dependency) can't "
+             "actually open one anyway. Only useful on your own desktop with a GUI-enabled OpenCV install.",
+    )
     args = parser.parse_args()
 
     if args.mock_pose:
@@ -313,7 +368,7 @@ def main():
             inject_form_fault=args.inject_form_fault,
         )
     else:
-        run_live(args.source, args.exercise, args.member_id, args.station_id)
+        run_live(args.source, args.exercise, args.member_id, args.station_id, display=args.display)
 
 
 if __name__ == "__main__":

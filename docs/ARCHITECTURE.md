@@ -3,9 +3,63 @@
 This repo implements the pure-software layers of the IRIX Technical
 Architecture & Design Document (mounted-camera + wristband form factor).
 It is a **software scaffold**: runnable module structure and unit-tested
-logic for the algorithms the doc specifies, not a production build. It does
-not include camera/network hardware, wristband firmware, Jetson deployment
-configs, or trained model weights.
+logic for the algorithms the doc specifies, not a production build. It
+does not include camera/network hardware, wristband firmware, or Jetson
+deployment configs. Trained model weights are a mixed bag rather than a
+blanket "not included" -- see "Model weights: what's real vs. still a
+stub" just below.
+
+## Model weights: what's real vs. still a stub
+
+Three modules in this repo wrap a model that needs weights to actually
+run. They are not equally solved:
+
+- **`irix.pose.estimator.PoseEstimator` -- real, working, done.**
+  `model_path="yolov8n-pose.pt"` is a genuine Ultralytics-published
+  checkpoint pretrained on COCO keypoints (the same 17-point layout
+  `COCO_KEYPOINT_NAMES` already assumes), auto-downloaded on first use --
+  no training, no API key, no cost, no gym-specific data collection
+  needed. Generic human pose estimation from a single RGB camera is a
+  solved, commodity problem; there was never a reason to train a custom
+  model for it. Verified end-to-end in this pass:
+  `tests/test_pose_estimator_integration.py` runs the real model against
+  a real image (correctly finds 2 people, >0.5 confidence on clearly-
+  visible joints) and a real (synthetic-but-real-codec) video through the
+  full `run_live` pipeline -- pose -> joint angle -> `RepCounter` ->
+  `FormScorer` -> structured events -- with no mocking anywhere in that
+  chain. Also surfaced and fixed a real bug while verifying this:
+  `run_live` used to call `cv2.imshow`/`cv2.waitKey` unconditionally,
+  which crashes with "the function is not implemented" against
+  `opencv-python-headless` (this repo's pinned dependency) on any
+  machine without a GTK/Cocoa/Windows GUI toolkit -- which describes
+  both a CI/sandbox environment *and* the real production target (a
+  station's edge box has no monitor attached). Display is now opt-in
+  (`--display`), off by default, and fails with a clear message instead
+  of an uncaught OpenCV exception if requested somewhere that can't
+  actually show a window.
+
+- **`irix.barbell.detector.FreeWeightDetector` -- still a stub.**
+  `model_path="freeweight_yolo.pt"` needs a checkpoint fine-tuned on
+  barbell/plate/dumbbell classes, which don't exist in any standard
+  pretrained object-detection model (COCO doesn't have a "barbell"
+  class). The module docstring points at the Roboflow "Barbells
+  Detector" dataset (92 labeled images, pretrained model available via
+  their API) as a starting point, but actually fine-tuning or wiring up
+  a hosted inference API is a real decision (account/API-key access,
+  cost, accuracy expectations) this repo hasn't made yet.
+
+- **`irix.weight_recognition.vlm_backend.LocalVLMBackend` -- still a
+  stub.** Raises `NotImplementedError`. The recommended default backend
+  (local-preferred over cloud, see "Weight recognition" below for why),
+  but implementing it for real means picking and integrating an actual
+  local VLM (e.g. a small open-weights model run via `transformers` or
+  `ollama`) -- again a real decision about model choice, latency/
+  hardware tradeoffs, and whether CPU inference on an edge box is even
+  fast enough, not something to guess at without a target device to
+  benchmark against. `GeminiVLMBackend` (cloud) has real integration
+  code and is usable today if a live cloud round-trip per read is
+  acceptable; it's just not the recommended production default per the
+  data-minimization reasoning in "Weight recognition" below.
 
 ## Where this repo ends and irix-mvp-app begins
 
@@ -28,7 +82,7 @@ is a placeholder pointed at wherever that endpoint ends up.
 
 | Design doc section | Repo module | Status |
 |---|---|---|
-| 4.1 Pose estimation model | `irix/pose/` | YOLO-Pose wrapper (`ultralytics`, optional dep); joint-angle geometry helper |
+| 4.1 Pose estimation model | `irix/pose/` | YOLO-Pose wrapper (`ultralytics`, optional dep); joint-angle geometry helper. Real, working pretrained weights -- see "Model weights" above |
 | 4.2 Rep-counting logic | `irix/rep_counting/` | Joint-angle state machine + per-exercise configs (squat/curl/deadlift/leg_press/hack_squat); each completed rep also carries inter-rep duration + peak/mean angular velocity for fatigue tracking (see below) |
 | 4.3 Multi-camera fusion & occlusion | -- | Not implemented; `PoseEstimator` returns single-view poses per camera, multi-view reprojection is future work |
 | 4.4 Weight & plate recognition | `irix/weight_recognition/` | VLM-based classifier (`vision_classifier.py`) is the deployable path -- see below for why QR stickers and OCR were both ruled out; `confirmation.py` adds N-of-M read-confirmation windowing |

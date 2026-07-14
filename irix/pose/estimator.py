@@ -9,6 +9,19 @@ with several lifters visible to one camera, unlike top-down estimators
 ``ultralytics`` is an optional dependency (see pyproject.toml `[pose]`
 extra) so the rest of the codebase (rep counting, fusion, pipeline, tests)
 can be imported and exercised without pulling in torch/ultralytics.
+
+**This one actually works with real, freely available weights, no
+training required.** The default ``model_path="yolov8n-pose.pt"`` is a
+real Ultralytics-published checkpoint pretrained on COCO keypoints --
+exactly the 17-point layout ``COCO_KEYPOINT_NAMES`` below already assumes
+-- and is auto-downloaded on first use (no API key, no cost, no gym-
+specific data collection). Generic human pose estimation is a solved,
+commodity problem; this module is not a stub waiting for a model that
+doesn't exist, unlike ``irix.barbell.detector.FreeWeightDetector`` and
+``irix.weight_recognition.vlm_backend.LocalVLMBackend`` (see their
+module docstrings). Verified end-to-end against a real image and a real
+video file in ``tests/test_pose_estimator_integration.py`` (skipped
+unless ``pip install irix[pose]`` is installed).
 """
 from __future__ import annotations
 

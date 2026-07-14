@@ -22,8 +22,19 @@ section-by-section mapping, every divergence's reasoning, and what's
 deliberately left unimplemented.
 
 **Status:** early scaffold, not production code. No camera/network
-hardware, wristband firmware, or trained model weights are included --
-those are hardware/deployment concerns outside a software repo's scope.
+hardware or wristband firmware is included -- those are hardware/
+deployment concerns outside a software repo's scope. Model weights are a
+mixed bag, worth being precise about: pose estimation
+(`irix.pose.estimator.PoseEstimator`) uses a real, freely available,
+auto-downloading pretrained checkpoint (`yolov8n-pose.pt`, COCO
+keypoints) and is verified end-to-end against a real image and video in
+`tests/test_pose_estimator_integration.py` -- generic human pose
+estimation is a solved, commodity problem, not something this project
+needs to train. Barbell/plate detection
+(`irix.barbell.detector.FreeWeightDetector`) and the local VLM backend
+(`irix.weight_recognition.vlm_backend.LocalVLMBackend`) are still
+untrained stubs -- there's no free commodity equivalent for either (see
+their module docstrings for what a real fix looks like for each).
 
 ## Install
 
