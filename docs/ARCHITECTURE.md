@@ -49,6 +49,25 @@ Two things are worth being explicit about:
   window + a `validate_weight_lbs` range/grid validator) rather than any
   vision library.
 
+## Ankle placement for machine leg exercises
+
+The design doc calls out leg press / hack squat as the case where wrist-IMU
+fusion (Section 4.6) contributes nothing: "the wrist doesn't move with the
+load." On those machines the *foot* is the rigid contact point with the
+load (the footplate) -- the same relationship the wrist has to a curl --
+so `ExerciseConfig.band_placement` (`irix/rep_counting/exercises.py`) lets
+`LEG_PRESS`/`HACK_SQUAT` specify `BandPlacement.ANKLE`, restoring a real
+fusion signal for exactly those two exercises. It does not extend to
+free-weight squats: feet stay planted there, so an ankle band sees almost
+no motion -- the barbell is what's moving, tracked by the camera
+(Section 4.5), not the ankle.
+
+`irix/coaching/triggers.py`'s `BandPlacementCoach` is the stateful piece
+that turns this into an actual spoken instruction: it tracks where the
+band currently is across a session and only prompts a reposition when the
+next exercise's `band_placement` differs from the current one, so a
+session that never touches a leg machine stays silent about it.
+
 Both ports are unit-tested against synthetic IMU/reading streams in
 `tests/test_imu_rep_counting.py` and `tests/test_confirmation.py`.
 
