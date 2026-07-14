@@ -273,6 +273,25 @@ Frames during that short buffering window aren't attributed to anyone
 (missed rather than guessed at) -- see `docs/ARCHITECTURE.md`'s "Crowded
 stations" section for the full trade-offs.
 
+**Overlapping multi-camera zones**: a different topology from "one
+camera per station" above -- several cameras with genuinely overlapping
+fields of view over one shared area (e.g. a busy free-weights floor),
+where the same person can be visible to more than one camera at once and
+members aren't confined to fixed labeled stations. `irix.live.zone_runner.
+MultiCameraZoneRunner` handles this: each camera runs its own
+disambiguation against the same zone-wide candidate wristband group, and
+the wristband IMU signal itself (not pixel-level re-identification) is
+what ties multiple cameras' views of one person together -- if two
+cameras both correlate a detection best against the same wristband, they
+agree it's the same physical person, without either camera needing to
+know the other exists. This also gives occlusion tolerance for free: a
+member invisible to one camera's angle still gets routed correctly via
+another camera that sees them, and a fixed camera-priority rule prevents
+double-counting when multiple cameras agree on the same person at once.
+Known limitation: bar-path *velocity* calibration isn't yet per-camera-
+aware (rep counting itself is unaffected) -- see `docs/ARCHITECTURE.md`'s
+"Overlapping multi-camera zones" section for the full reasoning.
+
 ## Test
 
 ```bash
@@ -293,7 +312,7 @@ irix/
   barbell/             self-calibrated (no environment edits) barbell/plate/dumbbell tracking, m/s bar velocity, RPE/velocity-loss estimation, optional GymAware-style camera-tilt correction for stations whose camera isn't perfectly perpendicular to the bar path
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, geometric plate-count cross-check, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
   pipeline/           edge buffer -> aggregator -> cloud sync; structured CameraEvent family (the API contract with irix-mvp-app); rep_session.py is the per-member pipeline (rep/form/weight/barbell/fatigue) shared by run_upload and the live station runner
-  live/               24/7-station pieces: camera_source.py (ReconnectingFrameSource, reconnects on drop instead of exiting), station_runner.py (StationSessionRunner -- ties checkout + BLE presence + live camera + live IMU + RepSession into one continuously-running station), gym_runner.py (GymSessionRunner -- runs several stations together with GymCoordinator-backed handoff so a member walking between them is never double-counted)
+  live/               24/7-station pieces: camera_source.py (ReconnectingFrameSource, reconnects on drop instead of exiting), disambiguation.py (CrowdedGroupDisambiguator -- one detection source's pose/IMU-buffering + motion-correlation resolution, shared by station_runner.py and zone_runner.py), station_runner.py (StationSessionRunner -- ties checkout + BLE presence + live camera + live IMU + RepSession into one continuously-running station, one camera per station), gym_runner.py (GymSessionRunner -- runs several stations together with GymCoordinator-backed handoff so a member walking between them is never double-counted), zone_runner.py (MultiCameraZoneRunner -- several cameras with overlapping fields of view over one shared area, segregating multiple co-located members via wristband-IMU correlation per camera rather than pixel-level cross-camera re-identification)
   demo/               single-station (run_demo.py), multi-station (run_gym_demo.py), and upload-mode (run_upload.py -- real video + real wristband file in, full event stream out) end-to-end CLIs
 tests/                 unit + smoke tests for every module above
 docs/ARCHITECTURE.md   design-doc-to-repo section map, including every place this repo diverges from the original design doc and why

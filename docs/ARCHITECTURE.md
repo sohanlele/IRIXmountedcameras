@@ -1063,6 +1063,82 @@ correctly resolved and routed to the right `RepSession` once the
 buffering window fills, with neither member's reps ever attributed to the
 other.
 
+## Overlapping multi-camera zones (a dense camera array, not one camera per station)
+
+Everything above -- `StationSessionRunner`, `GymSessionRunner`,
+`StationRegistry`'s 10-camera example layout -- assumes exactly one
+camera per station: a distinct rack/bench each with its own dedicated
+view. A real free-weights floor is sometimes covered differently: several
+cameras (the design doc's Section 3.1 range makes ~10 cameras over one
+busy area plausible) with genuinely **overlapping fields of view**, where
+the same physical person can be visible to more than one camera at once,
+and several members can be anywhere in that shared space simultaneously
+-- not confined to fixed labeled stations. That's a different problem
+from station-to-station handoff (`GymCoordinator`, moving *between*
+discrete stations) and from single-camera crowding
+(`CrowdedGroupDisambiguator` at *one* camera) above; it needed a third
+orchestrator rather than stretching either existing one.
+
+**`irix.live.disambiguation.CrowdedGroupDisambiguator`** is first a
+*refactor*, not new behavior: the pose/IMU-buffering, `MotionCorrelationResolver`-
+calling, sticky-until-group-changes logic that used to live inline in
+`StationSessionRunner` moved out into its own class, one instance per
+detection source. `StationSessionRunner` now owns exactly one instance
+(unchanged behavior -- its existing test suite passes unmodified against
+the refactor) and is the reason a multi-camera zone could reuse this
+logic directly rather than needing a parallel reimplementation.
+
+**`irix.live.zone_runner.MultiCameraZoneRunner`** is the new
+orchestrator for the overlapping-camera case: several `ZoneCamera`s (a
+frame source plus pose estimator each) covering one shared zone, each
+running its **own** `CrowdedGroupDisambiguator` against the **same**
+zone-wide candidate wristband group. Deliberately *not* attempting the
+general multi-camera person re-identification problem (matching a
+detection in camera A's frame to a detection in camera B's frame by
+appearance/geometry, the way sports-analytics systems like SkillCorner do
+with jersey-number recognition) -- consistent with this repo's existing
+stance (`irix.identity.motion_correlation`'s own docstring) that
+wristband-based identity is the simpler, more reliable choice over
+vision-only re-ID. Instead, **the wristband IMU signal itself is what
+ties multiple cameras' views of one person together**: if camera A's
+slot 2 and camera B's slot 0 both correlate best against wristband X's
+IMU, they're the same physical person, with neither camera ever needing
+to know the other exists or detected anyone that tick. This also gives
+occlusion tolerance for free -- a person invisible to one camera's angle
+this tick just doesn't get a routed entry from that camera, but still
+gets routed correctly via any other camera that currently sees them.
+
+**Avoiding double-counting when cameras agree.** When 2+ cameras
+independently resolve a pose for the *same* member in the same tick (a
+legitimately overlapping view), `MultiCameraZoneRunner.tick()` feeds
+exactly one of them into that member's `RepSession` -- a fixed
+camera-priority order (first camera, in the order the runner was
+constructed with, to have a routed pose for that member) decides which,
+never more than one `process_frame` call per member per tick.
+
+**Known limitation, stated plainly: bar-path calibration isn't
+per-camera-aware.** `RepSession`/`BarPathTracker` self-calibrate one
+px-per-mm scale from whichever camera's frame first showed a detected
+plate, then keep using it for that member's whole set (see
+`irix.barbell.calibration`). If a *different* camera later wins the
+per-tick routing for the same ongoing set, that stale calibration gets
+applied to a different camera's actual pixel geometry, and the
+calibrated **m/s bar-velocity numbers for that set become unreliable**.
+Rep counting itself is unaffected (joint angles are relative measurements
+between a single frame's own keypoints, not dependent on any absolute
+calibration). Not fixed in this pass -- doing so properly needs
+per-camera `CameraCalibration` objects and `RepSession`/`BarPathTracker`
+aware of which camera produced a given frame, a real, scoped follow-up
+rather than a quick patch to already-tested code.
+
+`tests/test_zone_runner.py` covers: two cameras with fully overlapping
+views of two co-located members produce exactly as many reps as a
+single-camera equivalent run (proving no double-counting); a member
+occluded from one camera's angle for a stretch of ticks still gets
+correctly attributed reps via the other camera that still sees them; and
+a lone member in the zone with multiple cameras watching still only ever
+gets fed by one camera per tick.
+
 ## End-to-end demo
 
 Two demo entrypoints, covering the two things worth demonstrating

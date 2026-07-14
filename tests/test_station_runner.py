@@ -323,7 +323,7 @@ def test_crowded_station_disambiguates_two_co_located_members_by_motion():
     # for whoever's left), which would otherwise make this assertion
     # observe a wiped-out {} rather than the resolution that actually
     # drove routing for the whole rest of the run.
-    assert runner._slot_assignment == {0: "band-carol", 1: "band-dave"}
+    assert runner._disambiguator.slot_assignment == {0: "band-carol", 1: "band-dave"}
     runner.close()
 
     rep_events = [e for e in events if e.to_dict()["event_type"] == "rep_completed"]
@@ -363,8 +363,8 @@ def test_single_member_station_never_triggers_disambiguation_buffering():
         clock=_FakeClock(step=0.1),
     )
     runner.run_forever(max_frames=20)
-    assert runner._pending_wristband_ids is None
-    assert runner._slot_assignment == {}
+    assert runner._disambiguator._pending_wristband_ids is None
+    assert runner._disambiguator.slot_assignment == {}
     rep_events = [e for e in events if e.to_dict()["event_type"] == "rep_completed"]
     assert len(rep_events) == 2
     assert all(e.member_id == "member-alice" for e in rep_events)

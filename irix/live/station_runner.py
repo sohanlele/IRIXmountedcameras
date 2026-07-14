@@ -18,13 +18,17 @@ in this repo:
   coming even if the camera drops and reconnects.
 - ``irix.fusion.imu_stream.IMUStream`` -- live samples for whichever
   band(s) are currently tracked, once a session is active.
-- ``irix.identity.motion_correlation.MotionCorrelationResolver`` (the
+- ``irix.live.disambiguation.CrowdedGroupDisambiguator`` (wraps
+  ``irix.identity.motion_correlation.MotionCorrelationResolver`` -- the
   same class ``irix.topology.handoff.GymCoordinator.
-  disambiguate_by_motion`` delegates to in the synthetic demo, used
-  directly here) -- when *more than one* checked-out band is present at
-  once, resolves which camera-detected skeleton belongs to which band by
-  correlating each candidate's wristband IMU signal against each
-  detected person's wrist motion.
+  disambiguate_by_motion`` delegates to in the synthetic demo) -- when
+  *more than one* checked-out band is present at once, resolves which
+  camera-detected skeleton belongs to which band by correlating each
+  candidate's wristband IMU signal against each detected person's wrist
+  motion. This class owns exactly one ``CrowdedGroupDisambiguator``
+  instance (one camera, one detection source); ``irix.live.zone_runner.
+  MultiCameraZoneRunner`` is the multi-camera generalization, one
+  instance per camera sharing the same candidate group.
 - ``irix.pipeline.rep_session.RepSession`` -- the actual per-member
   pipeline (already shared with ``irix.demo.run_upload``), now one
   instance per *currently-present* band, not just one for the whole
@@ -70,7 +74,7 @@ group of bands stays present. Two things worth being explicit about:
 from __future__ import annotations
 
 import time
-from typing import Callable, Dict, FrozenSet, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from ..barbell.detector import FreeWeightDetector
 from ..fusion.imu import IMUSample
@@ -80,24 +84,8 @@ from ..identity.checkout import CheckoutRegistry
 from ..identity.motion_correlation import MotionCorrelationResolver
 from ..pipeline.rep_session import RepSession
 from ..pipeline.schema import CameraEvent
-from ..pose.estimator import PersonPose
 from ..weight_recognition.vlm_backend import VLMBackend
-
-
-def _transpose_pose_buffer(pose_buffer: List[List[PersonPose]], n_slots: int) -> List[List[PersonPose]]:
-    """``pose_buffer`` is tick-major (one entry per tick, each the list of
-    people detected that tick); ``MotionCorrelationResolver.resolve``
-    wants person-major (one entry per detected-person slot, each that
-    slot's poses over time). A tick where the detected person count
-    didn't match ``n_slots`` (a missed/spurious detection) is dropped
-    rather than guessed at."""
-    slots: List[List[PersonPose]] = [[] for _ in range(n_slots)]
-    for tick_people in pose_buffer:
-        if len(tick_people) != n_slots:
-            continue
-        for i, pose in enumerate(tick_people):
-            slots[i].append(pose)
-    return slots
+from .disambiguation import CrowdedGroupDisambiguator
 
 
 class StationSessionRunner:
@@ -167,24 +155,13 @@ class StationSessionRunner:
             rest_gap_s=rest_gap_s,
         )
         self._on_events = on_events or (lambda events: None)
-        self._motion_resolver = motion_resolver or MotionCorrelationResolver()
-        self._disambiguation_window_frames = disambiguation_window_frames
+        self._disambiguator = CrowdedGroupDisambiguator(
+            motion_resolver=motion_resolver, disambiguation_window_frames=disambiguation_window_frames,
+        )
 
         self._sessions: Dict[str, RepSession] = {}
         self._imu_streams: Dict[str, Optional[IMUStream]] = {}
         self._last_seen: Dict[str, float] = {}
-
-        # Disambiguation buffering state -- only meaningful while >1
-        # session is active at once. `_pending_wristband_ids` is the
-        # frozen set of bands the current buffer/resolution is for; a
-        # change in that set (someone joins or leaves the ambiguous
-        # group) invalidates everything and starts a fresh window.
-        self._pending_wristband_ids: Optional[FrozenSet[str]] = None
-        self._pose_buffer: List[List[PersonPose]] = []
-        self._imu_disambiguation_buffer: Dict[str, List[IMUSample]] = {}
-        self._slot_assignment: Dict[int, str] = {}  # detected-person-index -> wristband_id, once resolved
-        self._buffer_started_at: Optional[float] = None
-        self._buffer_span_s: float = 0.0
 
     def _ensure_estimator(self):
         if self.pose_estimator is None:
@@ -226,57 +203,12 @@ class StationSessionRunner:
         self._last_seen.pop(wristband_id, None)
         if session is not None:
             self._on_events(session.close(end_ts=end_ts))
-        if self._pending_wristband_ids is not None and wristband_id in self._pending_wristband_ids:
-            # this band was part of the group currently being
-            # disambiguated -- that group just changed, so whatever's
-            # buffered is now stale.
-            self._reset_disambiguation()
-
-    def _reset_disambiguation(self) -> None:
-        self._pending_wristband_ids = None
-        self._pose_buffer = []
-        self._imu_disambiguation_buffer = {}
-        self._slot_assignment = {}
-        self._buffer_started_at = None
-        self._buffer_span_s = 0.0
-
-    def _resolve_disambiguation(self) -> None:
-        n_slots = len(self._pending_wristband_ids)
-        candidate_imu_streams: Dict[str, List[IMUSample]] = {}
-        wristband_by_member: Dict[str, str] = {}
-        for wristband_id in self._pending_wristband_ids:
-            member_id = self.checkout_registry.resolve_member(wristband_id)
-            if member_id is None:
-                continue
-            candidate_imu_streams[member_id] = self._imu_disambiguation_buffer.get(wristband_id, [])
-            wristband_by_member[member_id] = wristband_id
-
-        elapsed_ticks = max(len(self._pose_buffer) - 1, 1)
-        # effective fps from how much real time this buffer actually
-        # spans, not an assumed constant -- ticks in a live run don't
-        # necessarily land at a perfectly uniform interval.
-        pose_fps = float(elapsed_ticks) / self._buffer_span_s if self._buffer_span_s > 0 else 30.0
-
-        results = self._motion_resolver.resolve(
-            candidate_imu_streams=candidate_imu_streams,
-            detected_people_poses=_transpose_pose_buffer(self._pose_buffer, n_slots),
-            pose_fps=pose_fps,
-        )
-        self._slot_assignment = {}
-        for match in results:
-            if match is None:
-                continue
-            wristband_id = wristband_by_member.get(match.member_id)
-            if wristband_id is not None:
-                self._slot_assignment[match.person_index] = wristband_id
-
-        # Start a fresh buffer regardless of whether every slot resolved
-        # -- an unmatched slot gets another window to try again rather
-        # than blocking forever on one ambiguous group.
-        self._pose_buffer = []
-        self._imu_disambiguation_buffer = {wid: [] for wid in self._pending_wristband_ids}
-        self._buffer_started_at = None
-        self._buffer_span_s = 0.0
+        # A session ending always coincides with a present-set change,
+        # which the disambiguator's own route() already detects and
+        # resets for on its next call -- resetting here too is a harmless,
+        # slightly-earlier-than-strictly-necessary reset, not a behavior
+        # change (see CrowdedGroupDisambiguator.reset()'s docstring).
+        self._disambiguator.reset()
 
     def tick(self, frame, now: float, present_wristband_ids: List[str]) -> None:
         """One frame's worth of work, given an *already-resolved* list of
@@ -331,7 +263,7 @@ class StationSessionRunner:
             self._sessions[wristband_id].add_imu_samples(samples)
 
         if len(present_set) <= 1:
-            self._reset_disambiguation()
+            self._disambiguator.reset()
             if present_set:
                 wristband_id = next(iter(present_set))
                 session = self._sessions.get(wristband_id)
@@ -340,43 +272,13 @@ class StationSessionRunner:
                     self._on_events(session.process_frame(frame, now, person))
             return
 
-        self._route_ambiguous_frame(frame, now, people, polled, present_set)
-
-    def _route_ambiguous_frame(
-        self,
-        frame,
-        now: float,
-        people: List[PersonPose],
-        polled: Dict[str, List[IMUSample]],
-        present_set: "set[str]",
-    ) -> None:
-        current_ids = frozenset(present_set)
-        if self._pending_wristband_ids != current_ids:
-            self._pending_wristband_ids = current_ids
-            self._pose_buffer = []
-            self._imu_disambiguation_buffer = {wid: [] for wid in current_ids}
-            self._slot_assignment = {}
-            self._buffer_started_at = now
-            self._buffer_span_s = 0.0
-
-        if not self._slot_assignment:
-            self._pose_buffer.append(people)
-            for wristband_id in current_ids:
-                self._imu_disambiguation_buffer.setdefault(wristband_id, []).extend(polled.get(wristband_id, []))
-            self._buffer_span_s = now - self._buffer_started_at if self._buffer_started_at is not None else 0.0
-            if len(self._pose_buffer) >= self._disambiguation_window_frames:
-                self._resolve_disambiguation()
-            # Still ambiguous (or just resolved too late for this
-            # particular tick) -- nothing gets routed to anyone this
-            # tick; see the module docstring's trade-off note.
-            return
-
-        for slot, wristband_id in self._slot_assignment.items():
-            if slot >= len(people):
-                continue
+        routed = self._disambiguator.route(
+            now, frozenset(present_set), people, polled, self.checkout_registry.resolve_member,
+        )
+        for wristband_id, pose in routed.items():
             session = self._sessions.get(wristband_id)
             if session is not None:
-                self._on_events(session.process_frame(frame, now, people[slot]))
+                self._on_events(session.process_frame(frame, now, pose))
 
     def run_forever(self, max_frames: Optional[int] = None) -> None:
         """Runs until ``frame_source`` stops yielding (only happens in
