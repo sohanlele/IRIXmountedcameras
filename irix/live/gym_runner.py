@@ -21,12 +21,17 @@ single raw BLE reading source, and only tells each station's
 is actually authoritative there right now -- never two stations at once
 for the same band.
 
-Deliberately out of scope here (a real, separate problem):
-disambiguating two different checked-out members whose bands both
-resolve to the *same* crowded station, which RSSI proximity alone can't
-do -- that's ``GymCoordinator.disambiguate_by_motion``/``irix.identity.
-motion_correlation``, not wired into this runner yet. This module solves
-station-to-station handoff, not same-station crowding.
+Same-station crowding (two different checked-out members whose bands
+both resolve to the *same* station, which RSSI proximity alone can't
+disambiguate) is a separate problem from cross-station handoff, and is
+handled one level down: ``_present_wristbands_at`` below returns *every*
+currently-authoritative member at a station (not just one), and
+``StationSessionRunner.tick()`` is what actually buffers poses/IMU and
+calls ``irix.identity.motion_correlation.MotionCorrelationResolver`` to
+sort out who's who once more than one band is present there at once. See
+that module's docstring for the buffering/resolution details -- this
+module's job stops at "who's authoritative at this station right now",
+plural.
 """
 from __future__ import annotations
 
@@ -106,12 +111,21 @@ class GymSessionRunner:
             self._last_seen_ts[member_id] = now
             self._band_for_member[member_id] = wristband_id
 
-    def _present_wristband_at(self, station_id: str, now: float) -> Optional[str]:
+    def _present_wristbands_at(self, station_id: str, now: float) -> List[str]:
+        """Every band currently authoritative at ``station_id``, per
+        ``GymCoordinator`` -- may be more than one (a crowded station),
+        which is exactly the case ``StationSessionRunner.tick()`` needs
+        to know about in order to trigger motion-correlation
+        disambiguation instead of naively routing camera detections to a
+        single member."""
+        present = []
         for member_id in self.coordinator.active_members_at(station_id):
             last_seen = self._last_seen_ts.get(member_id)
             if last_seen is not None and (now - last_seen) < self.presence_timeout_s:
-                return self._band_for_member.get(member_id)
-        return None
+                wristband_id = self._band_for_member.get(member_id)
+                if wristband_id is not None:
+                    present.append(wristband_id)
+        return present
 
     def run_forever(self, max_frames: Optional[int] = None) -> None:
         """Runs until every station's ``frame_source`` is exhausted (only
@@ -147,8 +161,8 @@ class GymSessionRunner:
             self._update_gym_wide_presence(self.ble_reader(), now)
 
             for station_id, frame in frames.items():
-                present_wristband_id = self._present_wristband_at(station_id, now)
-                self.station_runners[station_id].tick(frame, now, present_wristband_id)
+                present_wristband_ids = self._present_wristbands_at(station_id, now)
+                self.station_runners[station_id].tick(frame, now, present_wristband_ids)
 
     def close(self) -> None:
         """Flush every station's in-progress session and release every

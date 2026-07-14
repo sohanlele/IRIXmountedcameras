@@ -251,12 +251,18 @@ gym = GymSessionRunner(
 gym.run_forever()
 ```
 
-Not wired in yet, a separate problem: two different checked-out members
-whose bands both resolve to the *same* crowded station, which RSSI
-proximity alone can't tell apart -- that needs `GymCoordinator.
-disambiguate_by_motion` (camera wrist motion vs. wristband IMU
-correlation, already built and tested, just not connected to
-`GymSessionRunner` yet).
+**Crowded stations**: a separate problem from station-to-station
+handoff above -- two different checked-out members whose bands both
+resolve to the *same* station at once, which RSSI proximity alone can't
+tell apart. `StationSessionRunner` now handles this directly: when more
+than one checked-out band is present at a station in the same tick, it
+buffers a short window of poses/IMU and resolves who's who via
+`irix.identity.motion_correlation.MotionCorrelationResolver` (wrist
+motion vs. wristband IMU correlation), then routes each detected person
+to the right member's session until the present-band group changes.
+Frames during that short buffering window aren't attributed to anyone
+(missed rather than guessed at) -- see `docs/ARCHITECTURE.md`'s "Crowded
+stations" section for the full trade-offs.
 
 ## Test
 

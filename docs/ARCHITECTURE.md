@@ -913,11 +913,14 @@ the exact double-counting problem `irix.topology.handoff.GymCoordinator`
 already solves for the synthetic multi-station demo (`run_gym_demo.py`),
 just never connected to anything live before now.
 
-`StationSessionRunner` gained a `tick(frame, now, present_wristband_id)`
+`StationSessionRunner` gained a `tick(frame, now, present_wristband_ids)`
 method, splitting "resolve who's present" from "given a resolution, do
 the frame's work" -- `run_forever` still resolves presence locally
 (unchanged behavior, existing tests pass unmodified), but `tick()` is now
-also callable directly with an externally-resolved presence.
+also callable directly with an externally-resolved presence. Note the
+plural: this used to be `present_wristband_id` (singular, at most one
+member per station); see the crowded-station section below for why that
+changed.
 
 `irix.live.gym_runner.GymSessionRunner` is that external resolver: it
 owns one `GymCoordinator` and one `CheckoutRegistry` shared across every
@@ -926,10 +929,11 @@ presence for every checked-out band from a single raw BLE reading source
 (`GymCoordinator.update_member`, same hysteresis logic `run_gym_demo.py`
 already exercises with synthetic readings -- `min_consecutive` readings
 favoring a different station before an actual handoff, not on every RSSI
-flicker), and calls each station's `tick()` with only the member
-`GymCoordinator.active_members_at(station_id)` says is actually
-authoritative there. A member's session at their old station closes the
-same way any absence does (`presence_timeout_s`, per member, tracked
+flicker), and calls each station's `tick()` with *every* member
+`GymCoordinator.active_members_at(station_id)` currently says is
+authoritative there (`_present_wristbands_at`, plural -- may be more than
+one at a crowded station). A member's session at their old station closes
+the same way any absence does (`presence_timeout_s`, per member, tracked
 gym-wide) once `GymCoordinator` re-resolves them to a different station --
 no separate "handoff" code path needed in `StationSessionRunner` itself,
 the existing absence-timeout logic already does the right thing once fed
@@ -940,15 +944,61 @@ station (proof the session actually moved, not merged or dropped), and a
 separate test with two members at two different stations simultaneously
 proving no cross-contamination.
 
-Deliberately still not wired in: `GymCoordinator.disambiguate_by_motion`
-(camera wrist motion vs. wristband IMU correlation, `irix.identity.
-motion_correlation`) for the *different* problem of two checked-out
-members' bands both resolving to the *same* crowded station -- RSSI
-proximity alone can't tell them apart, and `GymSessionRunner` doesn't
-attempt to yet. Already built and tested (`run_gym_demo.py` demonstrates
-it against synthetic candidates); connecting it to `GymSessionRunner` is
-a real next increment, not a hardware dependency like the BLE/IMU stubs
-above.
+**Crowded stations: disambiguating two co-located members.** Two
+checked-out members' bands can both legitimately resolve to the *same*
+station at once (a shared bench, a crowded curl rack) -- RSSI proximity
+alone can't tell them apart there (see `irix.identity.
+motion_correlation`'s module docstring for why), which used to leave this
+case explicitly unhandled. It's now wired into `StationSessionRunner`
+directly: internal per-session state (`_sessions`, `_imu_streams`,
+`_last_seen`) generalized from a single active session to dicts keyed by
+`wristband_id`, so more than one `RepSession` can be open at a station at
+once.
+
+Routing which detected person is which member is decided from *that
+tick's* actual present-band count, not from how many sessions happen to
+still be open -- a session past its last-seen tick keeps running through
+its ordinary `presence_timeout_s` grace period (tolerating a brief radio
+dropout, same as the single-session case always did) but simply doesn't
+receive a routed frame while it's not the sole band reported; an ordinary
+one-after-another handoff at a station (someone leaves, someone else
+steps up right after) still therefore routes unambiguously to whoever is
+actually seen *that* tick, without paying any disambiguation cost. Only a
+genuine same-tick multi-presence (two or more bands reported at once)
+triggers buffering.
+
+When that happens, `StationSessionRunner` accumulates a short window
+(`disambiguation_window_frames`, default 60 ticks) of every detected
+person's pose alongside every ambiguous band's raw IMU samples, then
+calls `irix.identity.motion_correlation.MotionCorrelationResolver`
+directly (the same class `GymCoordinator.disambiguate_by_motion`
+delegates to in the synthetic demo) to resolve which detected-person slot
+correlates with which band's wristband motion. The resolution is
+"sticky": once resolved, the same slot->band mapping keeps routing frames
+until the present-band group actually changes (someone new joins, or
+someone leaves), at which point a fresh window starts. Two trade-offs are
+stated plainly rather than hidden:
+
+- While a window is buffering (or for any detected-person slot that never
+  resolves confidently), frames for the still-ambiguous group aren't
+  attributed to anyone -- reps genuinely happening during that short
+  window are missed rather than guessed at.
+- Routing assumes a detected person's position in `PoseEstimator.
+  estimate()`'s returned list stays stable for the duration of one
+  buffering window. `PoseEstimator` doesn't run persistent cross-frame
+  tracking (`PersonPose.track_id` is just that frame's list index, not a
+  stable id), so this is a real assumption -- reasonable over a short
+  window with a static camera, not a guarantee over a long session, which
+  is exactly why re-resolution happens fresh every time the present-band
+  group changes rather than trusting one resolution indefinitely.
+
+`tests/test_station_runner.py::test_crowded_station_disambiguates_two_co_located_members_by_motion`
+exercises this end to end (not just the resolver in isolation, already
+covered by `tests/test_motion_correlation.py`): two members with
+distinguishable curl tempos, both present at one station from the start,
+correctly resolved and routed to the right `RepSession` once the
+buffering window fills, with neither member's reps ever attributed to the
+other.
 
 ## End-to-end demo
 

@@ -1,6 +1,9 @@
 """Ties together everything a real, continuously-running station needs
 that a single ``RepSession`` doesn't provide on its own: knowing *whose*
-session this even is, and *when* one starts and ends.
+session this even is, when one starts and ends, and -- since more than
+one checked-out member can legitimately be at the same station at once
+(a shared bench, a crowded curl rack) -- *which* detected person is
+which member.
 
 The pieces this composes, none of which talk to each other anywhere else
 in this repo:
@@ -13,40 +16,88 @@ in this repo:
   ``wristband_id``) -- who's currently near this station's radio.
 - ``irix.live.camera_source.ReconnectingFrameSource`` -- frames that keep
   coming even if the camera drops and reconnects.
-- ``irix.fusion.imu_stream.IMUStream`` -- live samples for whichever band
-  is the currently-tracked member's, once a session is active.
+- ``irix.fusion.imu_stream.IMUStream`` -- live samples for whichever
+  band(s) are currently tracked, once a session is active.
+- ``irix.identity.motion_correlation.MotionCorrelationResolver`` (the
+  same class ``irix.topology.handoff.GymCoordinator.
+  disambiguate_by_motion`` delegates to in the synthetic demo, used
+  directly here) -- when *more than one* checked-out band is present at
+  once, resolves which camera-detected skeleton belongs to which band by
+  correlating each candidate's wristband IMU signal against each
+  detected person's wrist motion.
 - ``irix.pipeline.rep_session.RepSession`` -- the actual per-member
-  pipeline (already shared with ``irix.demo.run_upload``).
+  pipeline (already shared with ``irix.demo.run_upload``), now one
+  instance per *currently-present* band, not just one for the whole
+  station.
 
-What "session" means here: a checked-out band showing up in this
-station's BLE readings starts one (a fresh ``RepSession``, and a request
-for that band's live ``IMUStream``); the band no longer showing up for
-``presence_timeout_s`` ends it (flush whatever set was in progress,
-release the ``RepSession``). This mirrors the "run_upload waits for a set
-to naturally show a gap, closes it" logic from ``RestGapSetBoundaryDetector``,
-just one level up -- that class decides when a *set* ends within an
-active session; this class decides when the *session itself* ends.
+What "session" means here: a checked-out band showing up starts one (a
+fresh ``RepSession``, and a request for that band's live ``IMUStream``);
+a band no longer showing up for ``presence_timeout_s`` ends it (flush
+whatever set was in progress, release the ``RepSession``). This mirrors
+the "run_upload waits for a set to naturally show a gap, closes it" logic
+from ``RestGapSetBoundaryDetector``, just one level up -- that class
+decides when a *set* ends within an active session; this class decides
+when the *session itself* ends.
 
-One thing this deliberately does NOT decide: which single wristband
-"wins" when several are visible to one station's radio at once (a
-plausible real scenario -- someone walking past, or spotting). The v1
-heuristic here is the simplest defensible one (strongest RSSI among
-*checked-out* bands), same spirit as ``StationPairing``'s own v1
-heuristic for the station-selection problem -- not claimed to be
-more rigorous than that.
+**The crowded-station case.** If exactly one band is present, routing is
+trivial: whatever person the camera detects is that member. If *more*
+than one checked-out band is present at once, ``irix.identity.
+ble_pairing``'s RSSI proximity alone can't say which detected skeleton is
+which -- see ``irix.identity.motion_correlation``'s module docstring for
+why and how. This class buffers a short window of (detected-person-slot,
+pose) and (wristband, raw IMU samples) data, calls
+``MotionCorrelationResolver`` once the window is full, and then routes
+each detected person to their resolved session for as long as the same
+group of bands stays present. Two things worth being explicit about:
+
+1. While a window is buffering (or for any slot that never resolves
+   confidently), frames for the still-ambiguous group aren't attributed
+   to anyone -- reps genuinely happening during that short window are
+   missed rather than guessed at. The window is short
+   (``disambiguation_window_frames`` frames, a few seconds at a typical
+   camera fps) and this only affects the *crowded* case, not the common
+   single-lifter one.
+2. Routing assumes a detected person's position in ``PoseEstimator.
+   estimate()``'s returned list stays consistent for the duration of one
+   buffering window -- ``PoseEstimator`` doesn't run persistent
+   cross-frame object tracking (``PersonPose.track_id`` is just that
+   frame's list index, not a stable id -- see ``irix/pose/estimator.py``).
+   Reasonable for a short window with a static camera; not a guarantee
+   over a long session, which is why re-resolution happens fresh every
+   time the present-band group actually changes rather than trusting one
+   resolution indefinitely.
 """
 from __future__ import annotations
 
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Dict, FrozenSet, List, Optional
 
 from ..barbell.detector import FreeWeightDetector
+from ..fusion.imu import IMUSample
 from ..fusion.imu_stream import IMUStream
 from ..identity.ble_pairing import BLEReading
 from ..identity.checkout import CheckoutRegistry
+from ..identity.motion_correlation import MotionCorrelationResolver
 from ..pipeline.rep_session import RepSession
 from ..pipeline.schema import CameraEvent
+from ..pose.estimator import PersonPose
 from ..weight_recognition.vlm_backend import VLMBackend
+
+
+def _transpose_pose_buffer(pose_buffer: List[List[PersonPose]], n_slots: int) -> List[List[PersonPose]]:
+    """``pose_buffer`` is tick-major (one entry per tick, each the list of
+    people detected that tick); ``MotionCorrelationResolver.resolve``
+    wants person-major (one entry per detected-person slot, each that
+    slot's poses over time). A tick where the detected person count
+    didn't match ``n_slots`` (a missed/spurious detection) is dropped
+    rather than guessed at."""
+    slots: List[List[PersonPose]] = [[] for _ in range(n_slots)]
+    for tick_people in pose_buffer:
+        if len(tick_people) != n_slots:
+            continue
+        for i, pose in enumerate(tick_people):
+            slots[i].append(pose)
+    return slots
 
 
 class StationSessionRunner:
@@ -66,8 +117,12 @@ class StationSessionRunner:
         rest_gap_s: float = 20.0,
         on_events: Optional[Callable[[List[CameraEvent]], None]] = None,
         clock: Optional[Callable[[], float]] = None,
+        motion_resolver: Optional[MotionCorrelationResolver] = None,
+        disambiguation_window_frames: int = 60,
     ):
-        """``ble_reader``: called once per frame tick, returns whatever
+        """``ble_reader``: called once per frame tick (in ``run_forever``
+        only -- ``tick()`` called directly, e.g. by ``irix.live.
+        gym_runner.GymSessionRunner``, bypasses this), returns whatever
         ``BLEReading``s (with ``wristband_id`` set) this station's radio
         currently sees -- real hardware/firmware detail, injected here as
         a callable so this class doesn't need to know how.
@@ -90,6 +145,11 @@ class StationSessionRunner:
         can drive ``presence_timeout_s`` deterministically instead of
         depending on real wall-clock time elapsing during a fast test
         loop.
+
+        ``motion_resolver``/``disambiguation_window_frames``: how a
+        crowded station (2+ checked-out bands present at once) gets
+        disambiguated -- see the module docstring. Irrelevant whenever at
+        most one band is present, which is the common case.
         """
         self.station_id = station_id
         self.exercise_name = exercise_name
@@ -107,11 +167,24 @@ class StationSessionRunner:
             rest_gap_s=rest_gap_s,
         )
         self._on_events = on_events or (lambda events: None)
+        self._motion_resolver = motion_resolver or MotionCorrelationResolver()
+        self._disambiguation_window_frames = disambiguation_window_frames
 
-        self._active_wristband_id: Optional[str] = None
-        self._active_session: Optional[RepSession] = None
-        self._active_imu_stream: Optional[IMUStream] = None
-        self._last_seen_ts: Optional[float] = None
+        self._sessions: Dict[str, RepSession] = {}
+        self._imu_streams: Dict[str, Optional[IMUStream]] = {}
+        self._last_seen: Dict[str, float] = {}
+
+        # Disambiguation buffering state -- only meaningful while >1
+        # session is active at once. `_pending_wristband_ids` is the
+        # frozen set of bands the current buffer/resolution is for; a
+        # change in that set (someone joins or leaves the ambiguous
+        # group) invalidates everything and starts a fresh window.
+        self._pending_wristband_ids: Optional[FrozenSet[str]] = None
+        self._pose_buffer: List[List[PersonPose]] = []
+        self._imu_disambiguation_buffer: Dict[str, List[IMUSample]] = {}
+        self._slot_assignment: Dict[int, str] = {}  # detected-person-index -> wristband_id, once resolved
+        self._buffer_started_at: Optional[float] = None
+        self._buffer_span_s: float = 0.0
 
     def _ensure_estimator(self):
         if self.pose_estimator is None:
@@ -120,25 +193,23 @@ class StationSessionRunner:
             self.pose_estimator = PoseEstimator()
         return self.pose_estimator
 
-    def _resolve_present_wristband(self) -> Optional[str]:
-        """Among this tick's BLE readings, the strongest-RSSI band that's
+    def _resolve_present_wristbands(self) -> List[str]:
+        """Every band, among this tick's local BLE readings, that's
         actually checked out to an account right now -- an unchecked-out
-        band (someone walked in wearing a band from a different gym /
-        past visit that never got returned) is never tracked, same as a
-        real front desk wouldn't start a session for a band it doesn't
-        currently have handed out."""
+        band (someone wearing a band from a different gym / a past visit
+        that never got returned) is never tracked, same as a real front
+        desk wouldn't start a session for a band it doesn't currently
+        have handed out. May return more than one -- see the module
+        docstring for how that's handled."""
         readings = self.ble_reader()
-        checked_out = [
-            r for r in readings
+        return list({
+            r.wristband_id for r in readings
             if r.wristband_id is not None and self.checkout_registry.is_checked_out(r.wristband_id)
-        ]
-        if not checked_out:
-            return None
-        return max(checked_out, key=lambda r: r.rssi).wristband_id
+        })
 
     def _start_session(self, wristband_id: str) -> None:
         member_id = self.checkout_registry.resolve_member(wristband_id)
-        assert member_id is not None  # guaranteed by _resolve_present_wristband's is_checked_out filter
+        assert member_id is not None  # guaranteed by callers checking is_checked_out first
         session = RepSession(
             exercise_name=self.exercise_name,
             member_id=member_id,
@@ -146,65 +217,172 @@ class StationSessionRunner:
             **self._session_kwargs,
         )
         self._on_events(session.initial_events)
-        self._active_wristband_id = wristband_id
-        self._active_session = session
-        self._active_imu_stream = self.imu_stream_factory(wristband_id) if self.imu_stream_factory else None
+        self._sessions[wristband_id] = session
+        self._imu_streams[wristband_id] = self.imu_stream_factory(wristband_id) if self.imu_stream_factory else None
 
-    def _end_session(self, end_ts: float) -> None:
-        if self._active_session is not None:
-            self._on_events(self._active_session.close(end_ts=end_ts))
-        self._active_wristband_id = None
-        self._active_session = None
-        self._active_imu_stream = None
-        self._last_seen_ts = None
+    def _end_session(self, wristband_id: str, end_ts: float) -> None:
+        session = self._sessions.pop(wristband_id, None)
+        self._imu_streams.pop(wristband_id, None)
+        self._last_seen.pop(wristband_id, None)
+        if session is not None:
+            self._on_events(session.close(end_ts=end_ts))
+        if self._pending_wristband_ids is not None and wristband_id in self._pending_wristband_ids:
+            # this band was part of the group currently being
+            # disambiguated -- that group just changed, so whatever's
+            # buffered is now stale.
+            self._reset_disambiguation()
 
-    def tick(self, frame, now: float, present_wristband_id: Optional[str]) -> None:
-        """One frame's worth of work, given an *already-resolved*
-        "which wristband is present at this station right now" (or
-        ``None``). ``run_forever`` below resolves that locally, once per
-        frame, via ``self.ble_reader()`` -- correct for a single isolated
-        station. ``irix.live.gym_runner.GymSessionRunner`` instead
-        resolves presence gym-wide (cross-station handoff hysteresis via
-        ``irix.topology.handoff.GymCoordinator``, so a station doesn't
-        just trust its own local RSSI snapshot) and calls this directly,
-        once per station per gym-wide tick, bypassing this station's own
-        ``ble_reader``/``_resolve_present_wristband`` entirely. Either
-        way, this method is the actual per-tick state machine: start a
-        session on a new presence, end one on absence past
-        ``presence_timeout_s`` (or immediately if a *different*
-        checked-out band preempts it), and feed the frame through if a
-        session is active.
+    def _reset_disambiguation(self) -> None:
+        self._pending_wristband_ids = None
+        self._pose_buffer = []
+        self._imu_disambiguation_buffer = {}
+        self._slot_assignment = {}
+        self._buffer_started_at = None
+        self._buffer_span_s = 0.0
+
+    def _resolve_disambiguation(self) -> None:
+        n_slots = len(self._pending_wristband_ids)
+        candidate_imu_streams: Dict[str, List[IMUSample]] = {}
+        wristband_by_member: Dict[str, str] = {}
+        for wristband_id in self._pending_wristband_ids:
+            member_id = self.checkout_registry.resolve_member(wristband_id)
+            if member_id is None:
+                continue
+            candidate_imu_streams[member_id] = self._imu_disambiguation_buffer.get(wristband_id, [])
+            wristband_by_member[member_id] = wristband_id
+
+        elapsed_ticks = max(len(self._pose_buffer) - 1, 1)
+        # effective fps from how much real time this buffer actually
+        # spans, not an assumed constant -- ticks in a live run don't
+        # necessarily land at a perfectly uniform interval.
+        pose_fps = float(elapsed_ticks) / self._buffer_span_s if self._buffer_span_s > 0 else 30.0
+
+        results = self._motion_resolver.resolve(
+            candidate_imu_streams=candidate_imu_streams,
+            detected_people_poses=_transpose_pose_buffer(self._pose_buffer, n_slots),
+            pose_fps=pose_fps,
+        )
+        self._slot_assignment = {}
+        for match in results:
+            if match is None:
+                continue
+            wristband_id = wristband_by_member.get(match.member_id)
+            if wristband_id is not None:
+                self._slot_assignment[match.person_index] = wristband_id
+
+        # Start a fresh buffer regardless of whether every slot resolved
+        # -- an unmatched slot gets another window to try again rather
+        # than blocking forever on one ambiguous group.
+        self._pose_buffer = []
+        self._imu_disambiguation_buffer = {wid: [] for wid in self._pending_wristband_ids}
+        self._buffer_started_at = None
+        self._buffer_span_s = 0.0
+
+    def tick(self, frame, now: float, present_wristband_ids: List[str]) -> None:
+        """One frame's worth of work, given an *already-resolved* list of
+        wristbands present at this station right now (0, 1, or more).
+        ``run_forever`` below resolves that locally, once per frame, via
+        ``self.ble_reader()`` -- correct for a single isolated station.
+        ``irix.live.gym_runner.GymSessionRunner`` instead resolves
+        presence gym-wide (cross-station handoff hysteresis) and calls
+        this directly, once per station per gym-wide tick, bypassing this
+        station's own ``ble_reader`` entirely.
+
+        Routing (single-vs-ambiguous) is decided from *this tick's*
+        ``present_wristband_ids``, not from how many ``RepSession``s
+        happen to still be open. A session that just stopped being
+        reported keeps running through its ``presence_timeout_s`` grace
+        period (tolerating a brief radio dropout, same as before this
+        class supported more than one session at once) but simply
+        doesn't receive this tick's detected person -- so an ordinary
+        one-after-another handoff at a station (someone leaves, someone
+        else steps up right after) still routes unambiguously to whoever
+        is actually seen *this* tick, and only genuine same-tick
+        multi-presence (two+ bands reported at once) triggers the
+        buffering/disambiguation path below.
         """
-        estimator = self._ensure_estimator()
+        present_set = set(present_wristband_ids)
 
-        if present_wristband_id is not None:
-            if self._active_wristband_id is not None and present_wristband_id != self._active_wristband_id:
-                # someone else showed up while a session was active --
-                # end the previous one first rather than silently
-                # attributing their reps to whoever was here before.
-                self._end_session(end_ts=self._last_seen_ts or now)
-            if self._active_session is None:
-                self._start_session(present_wristband_id)
-            self._last_seen_ts = now
-        elif self._active_session is not None and self._last_seen_ts is not None:
-            if now - self._last_seen_ts >= self.presence_timeout_s:
-                self._end_session(end_ts=self._last_seen_ts)
+        for wristband_id in list(self._sessions.keys()):
+            if wristband_id in present_set:
+                continue
+            last_seen = self._last_seen.get(wristband_id)
+            if last_seen is not None and (now - last_seen) >= self.presence_timeout_s:
+                self._end_session(wristband_id, end_ts=last_seen)
 
-        if self._active_session is None:
+        for wristband_id in present_wristband_ids:
+            self._last_seen[wristband_id] = now
+            if wristband_id not in self._sessions:
+                self._start_session(wristband_id)
+
+        if not self._sessions:
             return
 
-        if self._active_imu_stream is not None:
-            self._active_session.add_imu_samples(self._active_imu_stream.poll())
-
+        estimator = self._ensure_estimator()
         people = estimator.estimate(frame)
-        person = people[0] if people else None
-        self._on_events(self._active_session.process_frame(frame, now, person))
+
+        # IMU fusion keeps running for every open session, including one
+        # lingering in its grace period -- fusion shouldn't drop samples
+        # just because a session isn't receiving a routed pose this tick.
+        polled: Dict[str, List[IMUSample]] = {}
+        for wristband_id, imu_stream in self._imu_streams.items():
+            samples = imu_stream.poll() if imu_stream is not None else []
+            polled[wristband_id] = samples
+            self._sessions[wristband_id].add_imu_samples(samples)
+
+        if len(present_set) <= 1:
+            self._reset_disambiguation()
+            if present_set:
+                wristband_id = next(iter(present_set))
+                session = self._sessions.get(wristband_id)
+                if session is not None:
+                    person = people[0] if people else None
+                    self._on_events(session.process_frame(frame, now, person))
+            return
+
+        self._route_ambiguous_frame(frame, now, people, polled, present_set)
+
+    def _route_ambiguous_frame(
+        self,
+        frame,
+        now: float,
+        people: List[PersonPose],
+        polled: Dict[str, List[IMUSample]],
+        present_set: "set[str]",
+    ) -> None:
+        current_ids = frozenset(present_set)
+        if self._pending_wristband_ids != current_ids:
+            self._pending_wristband_ids = current_ids
+            self._pose_buffer = []
+            self._imu_disambiguation_buffer = {wid: [] for wid in current_ids}
+            self._slot_assignment = {}
+            self._buffer_started_at = now
+            self._buffer_span_s = 0.0
+
+        if not self._slot_assignment:
+            self._pose_buffer.append(people)
+            for wristband_id in current_ids:
+                self._imu_disambiguation_buffer.setdefault(wristband_id, []).extend(polled.get(wristband_id, []))
+            self._buffer_span_s = now - self._buffer_started_at if self._buffer_started_at is not None else 0.0
+            if len(self._pose_buffer) >= self._disambiguation_window_frames:
+                self._resolve_disambiguation()
+            # Still ambiguous (or just resolved too late for this
+            # particular tick) -- nothing gets routed to anyone this
+            # tick; see the module docstring's trade-off note.
+            return
+
+        for slot, wristband_id in self._slot_assignment.items():
+            if slot >= len(people):
+                continue
+            session = self._sessions.get(wristband_id)
+            if session is not None:
+                self._on_events(session.process_frame(frame, now, people[slot]))
 
     def run_forever(self, max_frames: Optional[int] = None) -> None:
         """Runs until ``frame_source`` stops yielding (only happens in
         tests, via ``max_frames`` -- a real ``ReconnectingFrameSource``
         yields forever). Each frame: resolve BLE presence locally (see
-        ``_resolve_present_wristband``) and hand off to ``tick()``.
+        ``_resolve_present_wristbands``) and hand off to ``tick()``.
         Runtime timestamps come from ``time.monotonic()``, the correct
         clock here (unlike ``irix.demo.run_upload``'s ``frame_index /
         fps``) since this is genuinely live: frame arrival time *is*
@@ -214,17 +392,15 @@ class StationSessionRunner:
         """
         for frame in self.frame_source.frames(max_frames=max_frames):
             now = self._clock()
-            present_wristband_id = self._resolve_present_wristband()
-            self.tick(frame, now, present_wristband_id)
+            present_wristband_ids = self._resolve_present_wristbands()
+            self.tick(frame, now, present_wristband_ids)
 
     def close(self) -> None:
-        """Flush the active session (if any) and release the frame
-        source -- call on shutdown."""
-        if self._active_session is not None:
-            self._on_events(self._active_session.close(end_ts=self._last_seen_ts or self._clock()))
-            self._active_session = None
-            self._active_wristband_id = None
-            self._active_imu_stream = None
+        """Flush every active session and release the frame source --
+        call on shutdown."""
+        for wristband_id in list(self._sessions.keys()):
+            last_seen = self._last_seen.get(wristband_id)
+            self._end_session(wristband_id, end_ts=last_seen if last_seen is not None else self._clock())
         close_fn = getattr(self.frame_source, "close", None)
         if close_fn is not None:
             close_fn()
