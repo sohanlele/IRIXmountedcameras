@@ -83,8 +83,9 @@ from ..fusion.imu_stream import IMUStream
 from ..identity.ble_pairing import BLEReading
 from ..identity.checkout import CheckoutRegistry
 from ..identity.motion_correlation import MotionCorrelationResolver
+from ..identity.placement import BandSide, WristbandPlacementTracker
 from ..pipeline.rep_session import RepSession
-from ..pipeline.schema import CameraEvent
+from ..pipeline.schema import BandPlacementConfirmedEvent, CameraEvent
 from ..pose.calibration import CalibrationProfile
 from ..weight_recognition.vlm_backend import VLMBackend
 from .disambiguation import CrowdedGroupDisambiguator
@@ -185,6 +186,12 @@ class StationSessionRunner:
         # docstring for why this repo doesn't auto-derive observations
         # from RepSession's own per-set rep timestamps.
         self._clock_sync_estimators: Dict[str, ClockSyncEstimator] = {}
+        # One WristbandPlacementTracker per currently-open session (Phase
+        # 3 default production behavior) -- see irix.identity.placement's
+        # module docstring for the full state machine. Starts assuming
+        # LEFT_WRIST (that class's own default) until something calls
+        # request_wristband_placement_change() for that band.
+        self._placement_trackers: Dict[str, WristbandPlacementTracker] = {}
 
     def _ensure_estimator(self):
         if self.pose_estimator is None:
@@ -220,17 +227,20 @@ class StationSessionRunner:
         member_id = self.checkout_registry.resolve_member(wristband_id)
         assert member_id is not None  # guaranteed by callers checking is_checked_out first
         clock_sync_estimator = ClockSyncEstimator()
+        placement_tracker = WristbandPlacementTracker(wristband_id)
         session = RepSession(
             exercise_name=self.exercise_name,
             member_id=member_id,
             station_id=self.station_id,
             start_ts=now,
             clock_sync_estimator=clock_sync_estimator,
+            placement_tracker=placement_tracker,
             **self._session_kwargs,
         )
         self._on_events(session.initial_events)
         self._sessions[wristband_id] = session
         self._clock_sync_estimators[wristband_id] = clock_sync_estimator
+        self._placement_trackers[wristband_id] = placement_tracker
         self._imu_streams[wristband_id] = self.imu_stream_factory(wristband_id) if self.imu_stream_factory else None
 
     def _end_session(self, wristband_id: str, end_ts: float) -> None:
@@ -238,6 +248,7 @@ class StationSessionRunner:
         self._imu_streams.pop(wristband_id, None)
         self._last_seen.pop(wristband_id, None)
         self._clock_sync_estimators.pop(wristband_id, None)
+        self._placement_trackers.pop(wristband_id, None)
         if session is not None:
             self._on_events(session.close(end_ts=end_ts))
         # A session ending always coincides with a present-set change,
@@ -275,6 +286,29 @@ class StationSessionRunner:
         estimator.add_observation(
             at_time=at_time if at_time is not None else self._clock(), offset_s=offset_s, confidence=confidence,
         )
+        return True
+
+    def request_wristband_placement_change(
+        self, wristband_id: str, to_side: BandSide, at_time: Optional[float] = None,
+    ) -> bool:
+        """Backend entry point for "this member's band has been moved"
+        (Priority 4/Section 5.2) -- called by a future IRIX app or
+        front-desk console once a member has been instructed to move
+        their band and has done so (this repo deliberately does not
+        build that app -- see ``irix.identity.placement``'s module
+        docstring). Returns whether a session for this band was open to
+        receive the request.
+
+        From this call until the tracker confirms the new side (see
+        ``WristbandPlacementTracker``'s state machine), that band's
+        ``RepSession.add_imu_samples`` drops every incoming batch rather
+        than fusing it -- both the settling/fastening-motion period and
+        any exercise this member is doing in the meantime that needs a
+        limb type the band isn't confirmed at yet."""
+        tracker = self._placement_trackers.get(wristband_id)
+        if tracker is None:
+            return False
+        tracker.request_change(to_side, at_time=at_time if at_time is not None else self._clock())
         return True
 
     def tick(self, frame, now: float, present_wristband_ids: List[str]) -> None:
@@ -329,7 +363,22 @@ class StationSessionRunner:
         for wristband_id, imu_stream in self._imu_streams.items():
             samples = imu_stream.poll() if imu_stream is not None else []
             polled[wristband_id] = samples
+            tracker = self._placement_trackers.get(wristband_id)
+            side_before = tracker.current_side if tracker is not None else None
             self._sessions[wristband_id].add_imu_samples(samples)
+            # add_imu_samples() itself drives the placement tracker (see
+            # RepSession's docstring) -- detect a same-tick STABLE
+            # confirmation here so it becomes a real, observable event
+            # rather than a change only visible by polling tracker state.
+            if tracker is not None and tracker.current_side != side_before:
+                self._on_events([
+                    BandPlacementConfirmedEvent(
+                        wristband_id=wristband_id,
+                        from_side=side_before.value if side_before is not None else "unknown",
+                        to_side=tracker.current_side.value,
+                        timestamp=now,
+                    )
+                ])
 
         if len(present_set) <= 1:
             self._disambiguator.reset()

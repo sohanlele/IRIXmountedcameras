@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from irix.demo.mock_pose import synthetic_imu_stream, synthetic_pose_stream
+from irix.fusion.imu import IMUSample
 from irix.identity.ble_pairing import BLEReading
 from irix.identity.checkout import CheckoutRegistry
 from irix.live.station_runner import StationSessionRunner
@@ -468,3 +469,98 @@ def test_calibrate_wristband_clock_corrects_that_bands_subsequent_imu_samples():
 
     # A band with no open session is a no-op, not an error.
     assert runner.calibrate_wristband_clock("band-nonexistent", offset_s=0.1, confidence=1.0) is False
+
+
+def test_leg_press_session_withholds_imu_until_placement_is_moved_to_ankle():
+    """A default-fresh band starts at BandSide.LEFT_WRIST (irix.identity.
+    placement.WristbandPlacementTracker's own documented default) -- a
+    leg_press session (ExerciseConfig.band_placement == ANKLE) should not
+    trust any IMU sample for fusion until request_wristband_placement_
+    change() moves it to an ankle side and the tracker confirms settling
+    + recalibration. This is the "never reuse wrist thresholds for ankle
+    data or vice versa" rule made concrete at the StationSessionRunner
+    level (irix.pipeline.rep_session.RepSession.add_imu_samples does the
+    actual gating -- see tests/test_wristband_placement.py for the
+    tracker's own state-machine tests in isolation)."""
+    from irix.identity.placement import BandSide
+    from irix.wristband_sim.calibration import GRAVITY_M_S2
+
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    present = [BLEReading(station_id="station-1", rssi=-40.0, timestamp=0.0, wristband_id="band-1")]
+
+    fs = 50.0
+    mismatched_samples = synthetic_imu_stream(n_seconds=1.0, fs=fs, reps_per_second=0.5, seed=1)
+    imu_stream = _ChunkedIMUStream(mismatched_samples, samples_per_poll=10)
+
+    events = []
+    runner = StationSessionRunner(
+        station_id="leg-press-1",
+        exercise_name="leg_press",
+        checkout_registry=registry,
+        frame_source=_FakeFrameSource(10),
+        ble_reader=_ScriptedBLEReader([present] * 10),
+        imu_stream_factory=lambda wid: imu_stream,
+        pose_estimator=_ScriptedPoseEstimator([]),
+        clock=_FakeClock(step=0.1),
+        on_events=events.extend,
+    )
+
+    runner.tick(frame=np.zeros((2, 2, 3), dtype=np.uint8), now=0.0, present_wristband_ids=["band-1"])
+    session = runner._sessions["band-1"]
+    tracker = runner._placement_trackers["band-1"]
+    assert tracker.current_side == BandSide.LEFT_WRIST
+    assert session._imu_samples == []  # wrist samples withheld -- exercise needs ankle
+
+    moved = runner.request_wristband_placement_change("band-1", BandSide.LEFT_ANKLE, at_time=0.1)
+    assert moved is True
+    assert tracker.paused is True
+
+    # Feed genuinely still, gravity-consistent samples (band now resting
+    # in its new ankle position) long enough to settle + calibrate.
+    rng = np.random.default_rng(7)
+    quiet_samples = []
+    t = 0.1
+    for _ in range(150):
+        accel = np.array([0.0, -GRAVITY_M_S2, 0.0]) + rng.normal(scale=0.05, size=3)
+        gyro = rng.normal(scale=0.05, size=3)
+        quiet_samples.append(IMUSample(timestamp=t, accel=accel, gyro=gyro))
+        t += 1.0 / fs
+    still_stream = _ChunkedIMUStream(quiet_samples, samples_per_poll=len(quiet_samples))
+    runner._imu_streams["band-1"] = still_stream
+
+    runner.tick(frame=np.zeros((2, 2, 3), dtype=np.uint8), now=0.2, present_wristband_ids=["band-1"])
+
+    assert tracker.current_side == BandSide.LEFT_ANKLE
+    assert tracker.paused is False
+
+    from irix.pipeline.schema import BandPlacementConfirmedEvent
+
+    confirmed = [e for e in events if isinstance(e, BandPlacementConfirmedEvent)]
+    assert len(confirmed) == 1
+    assert confirmed[0].wristband_id == "band-1"
+    assert confirmed[0].from_side == "left_wrist"
+    assert confirmed[0].to_side == "left_ankle"
+
+    # Now that placement matches the exercise's requirement, a fresh
+    # batch should actually be stored.
+    more_samples = synthetic_imu_stream(n_seconds=0.2, fs=fs, reps_per_second=0.5, seed=2)
+    runner._imu_streams["band-1"] = _ChunkedIMUStream(more_samples, samples_per_poll=len(more_samples))
+    runner.tick(frame=np.zeros((2, 2, 3), dtype=np.uint8), now=0.3, present_wristband_ids=["band-1"])
+    assert len(session._imu_samples) > 0
+
+
+def test_request_wristband_placement_change_for_unopened_band_is_a_no_op():
+    from irix.identity.placement import BandSide
+
+    registry = CheckoutRegistry()
+    runner = StationSessionRunner(
+        station_id="station-1",
+        exercise_name="squat",
+        checkout_registry=registry,
+        frame_source=_FakeFrameSource(1),
+        ble_reader=_ScriptedBLEReader([[]]),
+        pose_estimator=_ScriptedPoseEstimator([]),
+        clock=_FakeClock(step=0.1),
+    )
+    assert runner.request_wristband_placement_change("band-nonexistent", BandSide.LEFT_ANKLE) is False

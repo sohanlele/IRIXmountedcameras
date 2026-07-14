@@ -60,9 +60,26 @@ completed this phase removed, new gaps this phase's work surfaced added.
       cross-checks it against a VLM read (`method="vlm"`) when one is
       configured (`WeightConfirmedEvent.color_check_consistent`/
       `color_check_reason`, alongside the existing geometry check).
-- [ ] **Wire `irix.wristband_sim.calibration.calibrate_stationary` into
-      a real entry point** (still open from Phase 1 -- see
-      `docs/WRISTBAND_SYSTEM.md`).
+- [x] ~~Wire `irix.wristband_sim.calibration.calibrate_stationary` into
+      a real entry point~~ -- partially done: `irix.identity.placement.
+      WristbandPlacementTracker` now calls it on every placement-change
+      settle. **Still open**: an ordinary session that never changes
+      placement still runs on raw, uncalibrated samples from the start --
+      see `docs/WRISTBAND_SYSTEM.md`'s "Calibration" section.
+- [ ] **Wristband placement side laterality doesn't reach exercise
+      joint-triplet selection.** `irix.identity.placement.BandSide`
+      tracks left/right explicitly, but `ExerciseConfig.joint_triplet`
+      still hardcodes the left side throughout `irix/rep_counting/
+      exercises.py` (a pre-existing simplification, not something Phase
+      3's placement work changed) -- so a band confirmed on the *right*
+      wrist/ankle doesn't yet change which keypoints `RepSession` reads
+      pose angles from. Low priority until multi-person/crowded-station
+      accuracy work needs it.
+- [ ] **Automatic clock-sync calibration signal.** See the
+      `ClockSyncEstimator` entry above -- `estimate_offset_via_cross_
+      correlation` against camera-tracked wrist-keypoint vertical
+      velocity and raw wristband vertical accel is the identified next
+      step, not yet built.
 - [ ] **Add `schema_version` to the `CameraEvent` family** (still open --
       see `docs/API_SPEC.md`).
 - [ ] **Barbell/plate object detector** (`FreeWeightDetector`, still an

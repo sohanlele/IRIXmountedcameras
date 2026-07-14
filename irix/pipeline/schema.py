@@ -171,6 +171,33 @@ class BandPlacementRequiredEvent:
 
 
 @dataclass
+class BandPlacementConfirmedEvent:
+    """The member's IMU band's *actual physical* placement changed and
+    was confirmed by ``irix.identity.placement.WristbandPlacementTracker``
+    (settled + recalibrated -- see that module's state machine). Distinct
+    from ``BandPlacementRequiredEvent`` above, which is a top-down signal
+    ("the next exercise needs a different placement than before") fired
+    the moment an exercise transition is known about, before anyone has
+    necessarily moved anything; this one is the bottom-up confirmation
+    that a real, physical move actually happened and IMU fusion has
+    resumed trusting the band again."""
+
+    wristband_id: str
+    from_side: str  # BandSide.value, e.g. "left_wrist"
+    to_side: str
+    timestamp: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": "band_placement_confirmed",
+            "wristband_id": self.wristband_id,
+            "from_side": self.from_side,
+            "to_side": self.to_side,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
 class WeightConfirmedEvent:
     """A station's VisionPlateClassifier (Section 4.4) reached
     confirm_n-of-confirm_window agreement on the loaded weight."""

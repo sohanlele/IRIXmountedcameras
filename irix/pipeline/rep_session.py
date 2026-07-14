@@ -30,6 +30,7 @@ from ..fatigue.models import RepFatigueSample
 from ..fatigue.session_analysis import SessionFatigueTracker
 from ..fatigue.set_analysis import SetFatigueAnalyzer
 from ..fusion.clock_sync import ClockSyncEstimator, apply_clock_sync
+from ..identity.placement import WristbandPlacementTracker, limb_type_of
 from ..fusion.imu import IMUSample
 from ..fusion.rep_fusion import RepCountFusion
 from ..form.scoring import FormScorer
@@ -65,6 +66,7 @@ class RepSession:
         camera_tilt_deg_by_camera: Optional[Dict[str, float]] = None,
         start_ts: Optional[float] = None,
         clock_sync_estimator: Optional[ClockSyncEstimator] = None,
+        placement_tracker: Optional[WristbandPlacementTracker] = None,
     ):
         """``camera_tilt_deg``: the tilt correction to use for whichever
         camera's frames arrive without a more specific entry in
@@ -117,6 +119,23 @@ class RepSession:
         joint-angle velocity and raw wrist accel magnitude over the same
         window (see that function's tests for a validated example), run
         as an explicit calibration step rather than inferred per-set.
+
+        ``placement_tracker``: shared ``irix.identity.placement.
+        WristbandPlacementTracker`` for this member's band (Phase 3
+        default production behavior -- see ``irix.live.station_runner.
+        StationSessionRunner``, which constructs one per session by
+        default). While it reports ``paused`` (mid placement-change, see
+        that module's state machine docstring) or its current side's
+        limb type doesn't match this exercise's own ``ExerciseConfig.
+        band_placement`` requirement, incoming IMU samples are held back
+        from fusion entirely rather than trusted -- the "never reuse
+        wrist thresholds for ankle data or vice versa" rule made
+        concrete: an exercise needing ankle data gets camera-only
+        behavior (the existing, already-tested graceful degradation
+        path) for as long as the band's confirmed placement doesn't
+        actually match, rather than silently fusing mismatched-limb
+        samples. ``None`` (default) disables this -- every sample is
+        trusted immediately, unchanged from pre-Phase-3 behavior.
         """
         if exercise_name not in EXERCISES:
             raise ValueError(f"Unknown exercise {exercise_name!r} -- choices: {sorted(EXERCISES)}")
@@ -149,6 +168,7 @@ class RepSession:
         self._bar_calibrations: Dict[Optional[str], CameraCalibration] = {}
 
         self.clock_sync_estimator = clock_sync_estimator
+        self.placement_tracker = placement_tracker
 
         self._imu_samples: List[IMUSample] = []
         self._set_reps: List[RepFatigueSample] = []
@@ -183,9 +203,27 @@ class RepSession:
         If ``clock_sync_estimator`` was supplied, every incoming batch is
         corrected against its *current* best offset estimate before being
         stored (a no-op, offset 0.0, until the first set closes and
-        produces an observation -- see ``_close_set``)."""
+        produces an observation -- see ``_close_set``).
+
+        If ``placement_tracker`` was supplied, every batch is first fed
+        to it (so it can detect settling/calibration progress even while
+        its own samples aren't yet trustworthy for fusion -- see that
+        class's ``feed_samples``); the batch is then stored only if the
+        tracker reports both un-paused *and* currently at a side whose
+        limb type matches this exercise's ``band_placement`` requirement.
+        Otherwise the batch is dropped entirely for fusion purposes (not
+        buffered for "later" -- once a placement change genuinely
+        happens, whatever was captured mid-change or on the wrong limb
+        was never a usable signal for this exercise in the first place;
+        see ``irix.identity.placement``'s module docstring)."""
         if not samples:
             return
+        if self.placement_tracker is not None:
+            self.placement_tracker.feed_samples(samples)
+            if self.placement_tracker.paused:
+                return
+            if self.placement_tracker.limb_type != self.exercise.band_placement:
+                return
         if self.clock_sync_estimator is not None:
             estimate = self.clock_sync_estimator.estimate()
             if estimate.n_observations > 0:

@@ -61,13 +61,30 @@ trustworthy. `member_id`, `exercise`, `from_placement`/`to_placement`
 (`"wrist"` | `"ankle"`). Emitted only on an actual change, not every
 exercise (`irix.pipeline.events.BandPlacementTracker`).
 
+### `BandPlacementConfirmedEvent`
+The member's IMU band's *actual physical* placement changed and was
+confirmed (settled + recalibrated) by `irix.identity.placement.
+WristbandPlacementTracker` (Phase 3). Distinct from
+`BandPlacementRequiredEvent` above, which is the earlier, top-down "the
+next exercise needs a different placement" signal -- this is the
+bottom-up confirmation that the physical move actually happened and IMU
+fusion has resumed. `wristband_id`, `from_side`/`to_side`
+(`"left_wrist"` | `"right_wrist"` | `"left_ankle"` | `"right_ankle"` |
+`"unknown"`). See `docs/WRISTBAND_SYSTEM.md`.
+
 ### `WeightConfirmedEvent`
-A station's VLM-based classifier reached N-of-M read-confirmation
-agreement on the loaded weight. `member_id`, `station_id`, `exercise`,
-`weight_kg`, `confidence`, plus `geometry_consistent`/
-`geometry_check_reason` (an independent geometric plate-count
-cross-check against the barbell detector's own read, `None` if that
-detector wasn't configured for this station).
+A station's weight-recognition check reached agreement on the loaded
+weight -- `method` (`"vlm"` | `"color_plate"`) says which one produced
+this read: `"vlm"` when a VLM backend is configured for this station
+(N-of-M read-confirmation agreement); `"color_plate"` otherwise, from
+`irix.weight_recognition.plate_color_check`'s zero-training,
+no-API-key color-coded-bumper-plate detection (Phase 3 default).
+`member_id`, `station_id`, `exercise`, `weight_kg`, `confidence`, plus
+`geometry_consistent`/`geometry_check_reason` (independent geometric
+plate-count cross-check against the barbell detector's own read) and
+`color_check_consistent`/`color_check_reason` (cross-check between the
+VLM and color-plate reads when both ran) -- either pair is `None` when
+that particular check wasn't run for this reading.
 
 ### `StationHandoffEvent`
 A member's authoritative station changed. `member_id`, `from_station`,

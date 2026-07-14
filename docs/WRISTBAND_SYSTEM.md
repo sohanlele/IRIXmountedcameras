@@ -62,9 +62,54 @@ whichever axis is "up" while resting. `apply_calibration`/
 `irix.fusion`. Deliberately bias-only, not a full multi-orientation
 scale-factor/misalignment calibration (needs a turntable or several
 known orientations) -- unnecessary precision for rep counting rather
-than dead-reckoning navigation. **Not yet wired into any live/upload
-entry point** -- `run_upload.py`/`StationSessionRunner` currently consume
-raw (uncalibrated) samples; see `docs/TODO.md`.
+than dead-reckoning navigation.
+
+**Wired in (Phase 3), but only at one specific moment**:
+`irix.identity.placement.WristbandPlacementTracker` calls it every time a
+band settles after a placement change (see "Placement" below) -- that's
+a real, live entry point now, not just available-but-unused. What's
+still **not** wired: an initial calibration at ordinary session/checkout
+start (a band that's never had its placement explicitly changed keeps
+using raw, uncalibrated samples for its whole session) -- `run_upload.py`
+and a fresh `StationSessionRunner` session both still consume raw
+samples from the moment a session opens; see `docs/TODO.md`.
+
+## Placement
+
+`irix.identity.placement.WristbandPlacementTracker` -- the real-time
+state machine for *where the band is currently worn* (`BandSide`:
+`left_wrist` / `right_wrist` / `left_ankle` / `right_ankle` / `unknown`),
+as opposed to `irix.rep_counting.exercises.ExerciseConfig.
+band_placement`'s static wrist-vs-ankle *requirement* per exercise, and
+`irix.pipeline.events.BandPlacementTracker`'s top-down "the next exercise
+needs a different placement" signal (`BandPlacementRequiredEvent`).
+
+By exercise (Phase 3, per the founding brief's explicit placement
+guidance): squat, hack squat, lunge, Bulgarian split squat, and calf
+raise keep the band on the wrist -- feet stay in continuous ground
+contact for all five, so the camera is the primary lower-body kinematics
+source and the wrist IMU's role is sync/motion-onset/periodicity/
+identity/tempo/set-boundaries, not primary rep counting. Leg press, leg
+extension, leg curl, hip abduction, and hip adduction move the band to
+the ankle -- true machine-footplate exercises where the foot is the
+rigid contact point with the resisted load, the same relationship the
+wrist has to a curl.
+
+`irix.live.station_runner.StationSessionRunner.
+request_wristband_placement_change(wristband_id, to_side, at_time)` is
+the backend entry point a future IRIX app or front-desk console calls
+once a member has actually moved their band (this repo deliberately does
+not build that app). From that call until the tracker confirms the new
+side (`SETTLING` -> `CALIBRATING` -> `STABLE`, `calibrate_stationary`
+above providing the recalibration step, with the "up" axis estimated
+from the settled window's own data rather than assumed, since a band's
+rest orientation differs by which side/limb it's on), `RepSession.
+add_imu_samples` drops every incoming batch instead of fusing it --
+covering both the fastening-motion transition itself and any exercise in
+the meantime whose required limb type the band isn't confirmed at yet
+(**never reusing wrist thresholds for ankle data or vice versa**). A
+`BandPlacementConfirmedEvent` (`docs/API_SPEC.md`) fires the moment a
+change is confirmed.
 
 ## What's a hardware decision, not a software gap
 
