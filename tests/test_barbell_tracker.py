@@ -99,3 +99,35 @@ def test_camera_tilt_correction_increases_measured_velocity():
     assert tilted_result.mean_velocity_m_s == pytest.approx(
         level_result.mean_velocity_m_s / math.cos(math.radians(30.0)), rel=1e-6
     )
+
+
+def test_push_calibration_override_applies_only_to_that_call():
+    # A tracker built against one camera's calibration can still take a
+    # differently-scaled calibration for an individual push() call -- the
+    # scenario is a member's set spanning a camera switch in
+    # MultiCameraZoneRunner, where samples already in the buffer (from
+    # camera A) must stay untouched while a new sample (from camera B,
+    # twice the px/mm scale) gets converted with camera B's own numbers.
+    cal_a = _calibration()  # 0.0025 m/px
+    cal_b = calibrate_from_known_object(
+        pixel_size=360.0, real_world_size_mm=COMPETITION_BUMPER_PLATE_DIAMETER_MM, station_id="s1",
+    )  # double the px/mm scale of cal_a -> half the m/px
+
+    tracker = BarPathTracker(cal_a)
+    tracker.push(0.0, 1000.0)  # uses the default (cal_a)
+    tracker.push(1.0, 1000.0 - 100.0, calibration=cal_b)  # explicit override
+
+    # First sample: default calibration, no move -> position 0.
+    # Second sample: 100px of upward motion read through cal_b's (finer)
+    # scale, not the tracker's own cal_a.
+    expected_second_position = -cal_b.pixels_to_vertical_m(1000.0 - 100.0) - (
+        -cal_a.pixels_to_vertical_m(1000.0)
+    )
+    result = tracker.velocity_for_window(0.0, 1.0)
+    assert result.displacement_m == pytest.approx(expected_second_position, rel=1e-6)
+
+    # Sanity: had the override been ignored (i.e. cal_a used for both
+    # samples), the displacement would differ, since cal_a and cal_b have
+    # different px-per-mm scales.
+    wrong_displacement = -cal_a.pixels_to_vertical_m(1000.0 - 100.0) - (-cal_a.pixels_to_vertical_m(1000.0))
+    assert result.displacement_m != pytest.approx(wrong_displacement, rel=1e-6)

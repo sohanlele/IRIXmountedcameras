@@ -51,27 +51,23 @@ that has a routed pose for that member wins that tick). Never more than
 one ``process_frame`` call per member per tick, which would otherwise
 risk double-counting a rep.
 
-**Known limitation, stated plainly: bar-path calibration isn't
-per-camera-aware.** ``RepSession``/``BarPathTracker`` self-calibrate a
-single px-per-mm scale once, from whichever camera's frame first showed
-a detected plate, and keep using it for the rest of that member's set --
-see ``irix.barbell.calibration``'s module docstring. In a
-``MultiCameraZoneRunner`` deployment, if a different camera (with a
-different actual px-per-mm scale, since it's a different physical
-camera) later "wins" the per-tick routing for the same member's ongoing
-set, that stale calibration gets misapplied to a different camera's pixel
-geometry, and the calibrated **m/s bar-velocity numbers for that set
-become unreliable**. Joint-angle-based rep counting is *not* affected
-(joint angles are relative measurements between a frame's own keypoints,
-not dependent on any absolute px-per-mm calibration), so reps still count
-correctly -- only the velocity/RPE numbers derived from ``BarPathTracker``
-are at risk in this scenario. Not fixed here: doing so properly needs
-per-camera calibration objects and ``RepSession``/``BarPathTracker``
-aware of which camera produced a given frame, a real scoped follow-up,
-not attempted in this pass to avoid destabilizing already-tested code for
-a scenario (bar-path tracking specifically, in a *dense overlapping*
-multi-camera zone specifically) that's a smaller slice of the overall
-crowded-zone problem.
+**Bar-path calibration is per-camera-aware.** ``RepSession`` self-
+calibrates a separate px-per-mm scale independently for *each*
+``camera_id`` that has fed it a frame with a detected plate (keyed in
+``RepSession._bar_calibrations``), and ``BarPathTracker.push()`` takes an
+explicit per-call ``calibration`` override -- so when the per-tick camera
+routing below hands a different member's set off to a different physical
+camera mid-set, that camera's own calibration (self-calibrated the first
+time *that* camera saw a plate, not reused from whichever camera saw one
+first) is what gets applied to its pixels. Every sample already pushed
+stays in real-world meters regardless of which calibration produced it,
+so one continuous ``BarPathTracker``/velocity-window query still spans a
+camera switch correctly -- see ``irix.barbell.tracker.BarPathTracker.
+push``'s and ``irix.pipeline.rep_session.RepSession.process_frame``'s
+docstrings for the mechanics. Joint-angle-based rep counting was never
+affected by this either way (joint angles are relative measurements
+between a frame's own keypoints, not dependent on any absolute px-per-mm
+calibration).
 """
 from __future__ import annotations
 
@@ -129,6 +125,7 @@ class MultiCameraZoneRunner:
         clock: Optional[Callable[[], float]] = None,
         motion_resolver: Optional[MotionCorrelationResolver] = None,
         disambiguation_window_frames: int = 60,
+        camera_tilt_deg_by_camera: Optional[Dict[str, float]] = None,
     ):
         """``cameras``: every camera covering this zone, in a fixed
         priority order -- when 2+ cameras resolve a pose for the same
@@ -142,6 +139,14 @@ class MultiCameraZoneRunner:
         only), returns every currently-visible ``BLEReading`` for this
         zone's radio(s) -- same shape as ``StationSessionRunner``'s own
         ``ble_reader``, just zone-wide instead of per-station.
+
+        ``camera_tilt_deg_by_camera``: optional ``camera_id -> tilt_deg``
+        map, forwarded verbatim into every ``RepSession`` this runner
+        creates (see ``RepSession.__init__``'s docstring). Since a zone's
+        cameras are physically distinct mountings, they can plausibly
+        have different actual tilt angles relative to the bar's vertical
+        travel plane -- this lets each one get its own correction rather
+        than sharing one value across the whole zone.
 
         Every other parameter mirrors ``StationSessionRunner``'s
         constructor exactly -- see that class's docstring for the ones
@@ -162,6 +167,7 @@ class MultiCameraZoneRunner:
             weight_check_every_n_frames=weight_check_every_n_frames,
             barbell_detector=barbell_detector,
             rest_gap_s=rest_gap_s,
+            camera_tilt_deg_by_camera=camera_tilt_deg_by_camera,
         )
         self._on_events = on_events or (lambda events: None)
         for camera in self.cameras:
@@ -262,12 +268,19 @@ class MultiCameraZoneRunner:
                     continue
                 people = self._ensure_estimator(camera).estimate(frame)
                 if people:
-                    self._on_events(session.process_frame(frame, now, people[0]))
+                    self._on_events(session.process_frame(frame, now, people[0], camera_id=camera.camera_id))
                     break
             return
 
         candidate_ids = frozenset(present_set)
-        routed_this_tick: Dict[str, Tuple[np.ndarray, PersonPose]] = {}
+        # (camera_id, frame, pose) rather than just (frame, pose) -- the
+        # camera_id has to survive into the feed loop below so each
+        # member's RepSession.process_frame call knows which camera this
+        # tick's pose came from, and therefore which camera's own
+        # calibration to self-calibrate/read bar-path pixels against (see
+        # module docstring's "Bar-path calibration is per-camera-aware"
+        # section).
+        routed_this_tick: Dict[str, Tuple[str, np.ndarray, PersonPose]] = {}
         for camera in self.cameras:
             frame = frames.get(camera.camera_id)
             if frame is None:
@@ -278,12 +291,12 @@ class MultiCameraZoneRunner:
             )
             for wristband_id, pose in routed.items():
                 if wristband_id not in routed_this_tick:
-                    routed_this_tick[wristband_id] = (frame, pose)
+                    routed_this_tick[wristband_id] = (camera.camera_id, frame, pose)
 
-        for wristband_id, (frame, pose) in routed_this_tick.items():
+        for wristband_id, (camera_id, frame, pose) in routed_this_tick.items():
             session = self._sessions.get(wristband_id)
             if session is not None:
-                self._on_events(session.process_frame(frame, now, pose))
+                self._on_events(session.process_frame(frame, now, pose, camera_id=camera_id))
 
     def run_forever(self, max_frames: Optional[int] = None) -> None:
         """Runs until every camera's ``frame_source`` is exhausted (only

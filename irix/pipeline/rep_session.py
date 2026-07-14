@@ -18,11 +18,11 @@ keeping in exactly one place.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
-from ..barbell.calibration import calibrate_from_known_object, COMPETITION_BUMPER_PLATE_DIAMETER_MM
+from ..barbell.calibration import CameraCalibration, calibrate_from_known_object, COMPETITION_BUMPER_PLATE_DIAMETER_MM
 from ..barbell.detector import FreeWeightClass, FreeWeightDetection, FreeWeightDetector
 from ..barbell.rpe import RPETracker
 from ..barbell.tracker import BarPathTracker
@@ -60,7 +60,25 @@ class RepSession:
         barbell_detector: Optional[FreeWeightDetector] = None,
         rest_gap_s: float = 20.0,
         camera_tilt_deg: float = 0.0,
+        camera_tilt_deg_by_camera: Optional[Dict[str, float]] = None,
     ):
+        """``camera_tilt_deg``: the tilt correction to use for whichever
+        camera's frames arrive without a more specific entry in
+        ``camera_tilt_deg_by_camera`` -- the only one that matters for
+        the common single-camera case (``irix.live.station_runner.
+        StationSessionRunner``, ``irix.demo.run_upload``), where every
+        frame implicitly comes from "the" camera (``process_frame``'s
+        ``camera_id`` stays ``None`` throughout).
+
+        ``camera_tilt_deg_by_camera``: per-``camera_id`` tilt overrides
+        for a member tracked across more than one camera at once (``irix.
+        live.zone_runner.MultiCameraZoneRunner``) -- different physical
+        cameras covering the same zone are very plausibly mounted at
+        different angles, so one shared tilt value wouldn't be correct
+        for all of them. See ``process_frame``'s ``camera_id`` parameter
+        and this class's bar-tracking block for how this feeds into
+        per-camera self-calibration.
+        """
         if exercise_name not in EXERCISES:
             raise ValueError(f"Unknown exercise {exercise_name!r} -- choices: {sorted(EXERCISES)}")
         self.exercise = EXERCISES[exercise_name]
@@ -70,6 +88,7 @@ class RepSession:
         self.weight_check_every_n_frames = weight_check_every_n_frames
         self.barbell_detector = barbell_detector
         self.camera_tilt_deg = camera_tilt_deg
+        self.camera_tilt_deg_by_camera = camera_tilt_deg_by_camera or {}
 
         self.counter = RepCounter(self.exercise)
         self.form_scorer = FormScorer()
@@ -81,6 +100,14 @@ class RepSession:
         self.weight_classifier = VisionPlateClassifier(vlm_backend) if vlm_backend is not None else None
         self.rpe_tracker = RPETracker(exercise_name) if barbell_detector is not None else None
         self.bar_tracker: Optional[BarPathTracker] = None
+        # One CameraCalibration per camera_id (None is the key for the
+        # common single-camera case), each self-calibrated independently
+        # the first time *that* camera's frame shows a detected plate --
+        # see process_frame's bar-tracking block. Different physical
+        # cameras have different actual px-per-mm scales even for the
+        # same plate, so a calibration derived from camera A's pixels
+        # must never be applied to camera B's.
+        self._bar_calibrations: Dict[Optional[str], CameraCalibration] = {}
 
         self._imu_samples: List[IMUSample] = []
         self._set_reps: List[RepFatigueSample] = []
@@ -94,6 +121,15 @@ class RepSession:
         if band_event is not None:
             self.initial_events.append(band_event)
 
+    def _camera_tilt_for(self, camera_id: Optional[str]) -> float:
+        """The tilt-correction angle to use when self-calibrating a frame
+        that came from ``camera_id`` -- ``camera_tilt_deg_by_camera``'s
+        entry for that camera_id if one was given, else the single
+        shared ``camera_tilt_deg`` (which is exactly right for the
+        common single-camera case, where ``camera_id`` stays ``None``
+        throughout)."""
+        return self.camera_tilt_deg_by_camera.get(camera_id, self.camera_tilt_deg)
+
     def add_imu_samples(self, samples: List[IMUSample]) -> None:
         """Feed newly-available IMU samples in -- called once with a
         whole loaded file (offline, see ``irix.demo.run_upload``) or
@@ -104,12 +140,27 @@ class RepSession:
         logic downstream of this."""
         self._imu_samples.extend(samples)
 
-    def process_frame(self, frame: np.ndarray, ts: float, person: Optional[PersonPose]) -> List[CameraEvent]:
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        ts: float,
+        person: Optional[PersonPose],
+        camera_id: Optional[str] = None,
+    ) -> List[CameraEvent]:
         """Feed one frame in (plus that frame's resolved pose for this
         member, if any -- a live caller resolves which detected person in
         a multi-person frame is this member elsewhere; this class stays
         agnostic of that). Returns any events this frame produced (often
-        none)."""
+        none).
+
+        ``camera_id`` identifies which physical camera this frame came
+        from -- ``None`` (the default) for the common single-camera case.
+        A member tracked across more than one overlapping-FOV camera at
+        once (``irix.live.zone_runner.MultiCameraZoneRunner``) will call
+        this once per camera per tick with each camera's own id, so that
+        the bar-tracking block below self-calibrates and reads pixels
+        separately per camera rather than misapplying one camera's
+        px-per-mm scale to another's frames."""
         events: List[CameraEvent] = []
         self._frame_count += 1
 
@@ -138,21 +189,29 @@ class RepSession:
                 )
 
         # -- barbell centroid tracking (self-calibrates from the first
-        # detected plate, then feeds BarPathTracker every frame) --
+        # detected plate, per camera_id, then feeds BarPathTracker every
+        # frame using *that camera's own* calibration -- see
+        # process_frame's camera_id docstring and BarPathTracker.push's
+        # docstring for why one continuous tracker/buffer still works
+        # correctly across a camera switch even though calibration is
+        # per-camera) --
         if self.barbell_detector is not None:
             detections: List[FreeWeightDetection] = self.barbell_detector.detect(frame)
-            if self.bar_tracker is None:
+            calibration = self._bar_calibrations.get(camera_id)
+            if calibration is None:
                 plate = FreeWeightDetector.largest_plate(detections)
                 if plate is not None:
                     calibration = calibrate_from_known_object(
                         plate.pixel_diameter, COMPETITION_BUMPER_PLATE_DIAMETER_MM, self.station_id,
-                        camera_tilt_deg=self.camera_tilt_deg,
+                        camera_tilt_deg=self._camera_tilt_for(camera_id),
                     )
-                    self.bar_tracker = BarPathTracker(calibration)
-            if self.bar_tracker is not None:
+                    self._bar_calibrations[camera_id] = calibration
+                    if self.bar_tracker is None:
+                        self.bar_tracker = BarPathTracker(calibration)
+            if self.bar_tracker is not None and calibration is not None:
                 bar = next((d for d in detections if d.class_label == FreeWeightClass.BARBELL), None)
                 if bar is not None:
-                    self.bar_tracker.push(ts, bar.centroid_px[1])
+                    self.bar_tracker.push(ts, bar.centroid_px[1], calibration=calibration)
 
         # -- pose -> joint angle -> rep counting -> form scoring --
         if person is None:

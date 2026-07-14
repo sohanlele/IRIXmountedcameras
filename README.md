@@ -288,9 +288,12 @@ know the other exists. This also gives occlusion tolerance for free: a
 member invisible to one camera's angle still gets routed correctly via
 another camera that sees them, and a fixed camera-priority rule prevents
 double-counting when multiple cameras agree on the same person at once.
-Known limitation: bar-path *velocity* calibration isn't yet per-camera-
-aware (rep counting itself is unaffected) -- see `docs/ARCHITECTURE.md`'s
-"Overlapping multi-camera zones" section for the full reasoning.
+Bar-path velocity calibration is per-camera-aware: each camera_id
+self-calibrates its own px-per-mm scale independently, so if a member's
+set switches from one physical camera to another mid-set, the velocity
+math switches to that camera's own calibration rather than misapplying
+the first camera's -- see `docs/ARCHITECTURE.md`'s "Overlapping
+multi-camera zones" section for the full reasoning.
 
 ## Test
 

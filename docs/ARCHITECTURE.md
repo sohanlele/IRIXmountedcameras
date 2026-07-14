@@ -1116,20 +1116,31 @@ camera-priority order (first camera, in the order the runner was
 constructed with, to have a routed pose for that member) decides which,
 never more than one `process_frame` call per member per tick.
 
-**Known limitation, stated plainly: bar-path calibration isn't
-per-camera-aware.** `RepSession`/`BarPathTracker` self-calibrate one
-px-per-mm scale from whichever camera's frame first showed a detected
-plate, then keep using it for that member's whole set (see
-`irix.barbell.calibration`). If a *different* camera later wins the
-per-tick routing for the same ongoing set, that stale calibration gets
-applied to a different camera's actual pixel geometry, and the
-calibrated **m/s bar-velocity numbers for that set become unreliable**.
-Rep counting itself is unaffected (joint angles are relative measurements
-between a single frame's own keypoints, not dependent on any absolute
-calibration). Not fixed in this pass -- doing so properly needs
-per-camera `CameraCalibration` objects and `RepSession`/`BarPathTracker`
-aware of which camera produced a given frame, a real, scoped follow-up
-rather than a quick patch to already-tested code.
+**Bar-path calibration is per-camera-aware.** When routing switches a
+member's ongoing set from one physical camera to another mid-set, bar
+velocity switches with it -- `RepSession` self-calibrates a separate
+px-per-mm `CameraCalibration` independently for each `camera_id` that has
+fed it a frame with a detected plate (`RepSession._bar_calibrations`,
+keyed by `camera_id`; `None` for the single-camera case, where
+`process_frame`'s `camera_id` parameter is never passed), and
+`BarPathTracker.push()` takes an explicit per-call `calibration`
+override. `MultiCameraZoneRunner.tick()` passes `camera_id=camera.
+camera_id` into every `process_frame` call it makes (both the
+single-member "no ambiguity" path and the multi-member disambiguated
+path), so whichever camera actually produced a given frame is what its
+pixels get calibrated/converted against -- never a stale calibration
+carried over from whichever camera calibrated first. Since `BarPathTracker`
+samples are stored in real-world meters at push time (not raw pixels),
+one continuous sample buffer/velocity-window query still works correctly
+across a camera switch mid-rep or mid-set -- only the pixel-to-meters
+conversion *at push time* needs to know which camera produced that
+particular measurement; nothing downstream does. `camera_tilt_deg_by_camera`
+(on both `RepSession` and, forwarded through, `MultiCameraZoneRunner`)
+lets each camera's tilt-correction angle differ too, since distinct
+physical mountings can plausibly be angled differently. Rep counting was
+never affected by any of this either way (joint angles are relative
+measurements between a single frame's own keypoints, not dependent on any
+absolute calibration).
 
 `tests/test_zone_runner.py` covers: two cameras with fully overlapping
 views of two co-located members produce exactly as many reps as a
@@ -1137,7 +1148,15 @@ single-camera equivalent run (proving no double-counting); a member
 occluded from one camera's angle for a stretch of ticks still gets
 correctly attributed reps via the other camera that still sees them; and
 a lone member in the zone with multiple cameras watching still only ever
-gets fed by one camera per tick.
+gets fed by one camera per tick. `tests/test_rep_session_camera_calibration.py`
+covers the per-camera-calibration fix directly: two cameras with
+different pixel scales for the same physical plate each get their own
+`CameraCalibration`; a set that switches from camera A to camera B
+mid-set produces a bar-path displacement matching each camera's own
+calibration for the samples it produced (not camera A's scale misapplied
+to camera B's pixels); `camera_tilt_deg_by_camera` overrides thread
+through correctly; and the single-camera case (`camera_id=None`
+throughout) is unaffected.
 
 ## End-to-end demo
 
