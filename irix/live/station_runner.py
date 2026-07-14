@@ -158,49 +158,64 @@ class StationSessionRunner:
         self._active_imu_stream = None
         self._last_seen_ts = None
 
+    def tick(self, frame, now: float, present_wristband_id: Optional[str]) -> None:
+        """One frame's worth of work, given an *already-resolved*
+        "which wristband is present at this station right now" (or
+        ``None``). ``run_forever`` below resolves that locally, once per
+        frame, via ``self.ble_reader()`` -- correct for a single isolated
+        station. ``irix.live.gym_runner.GymSessionRunner`` instead
+        resolves presence gym-wide (cross-station handoff hysteresis via
+        ``irix.topology.handoff.GymCoordinator``, so a station doesn't
+        just trust its own local RSSI snapshot) and calls this directly,
+        once per station per gym-wide tick, bypassing this station's own
+        ``ble_reader``/``_resolve_present_wristband`` entirely. Either
+        way, this method is the actual per-tick state machine: start a
+        session on a new presence, end one on absence past
+        ``presence_timeout_s`` (or immediately if a *different*
+        checked-out band preempts it), and feed the frame through if a
+        session is active.
+        """
+        estimator = self._ensure_estimator()
+
+        if present_wristband_id is not None:
+            if self._active_wristband_id is not None and present_wristband_id != self._active_wristband_id:
+                # someone else showed up while a session was active --
+                # end the previous one first rather than silently
+                # attributing their reps to whoever was here before.
+                self._end_session(end_ts=self._last_seen_ts or now)
+            if self._active_session is None:
+                self._start_session(present_wristband_id)
+            self._last_seen_ts = now
+        elif self._active_session is not None and self._last_seen_ts is not None:
+            if now - self._last_seen_ts >= self.presence_timeout_s:
+                self._end_session(end_ts=self._last_seen_ts)
+
+        if self._active_session is None:
+            return
+
+        if self._active_imu_stream is not None:
+            self._active_session.add_imu_samples(self._active_imu_stream.poll())
+
+        people = estimator.estimate(frame)
+        person = people[0] if people else None
+        self._on_events(self._active_session.process_frame(frame, now, person))
+
     def run_forever(self, max_frames: Optional[int] = None) -> None:
         """Runs until ``frame_source`` stops yielding (only happens in
         tests, via ``max_frames`` -- a real ``ReconnectingFrameSource``
-        yields forever). Each frame: check BLE presence, start/end a
-        session as checked-out members come and go, and if a session is
-        active, feed the frame (and any newly-available IMU samples)
-        into its ``RepSession``. Runtime timestamps come from
-        ``time.monotonic()``, the correct clock here (unlike
-        ``irix.demo.run_upload``'s ``frame_index / fps``) since this is
-        genuinely live: frame arrival time *is* wall-clock time for a
-        live camera, and BLE presence/timeout logic has to be measured
-        against the same clock the radio readings themselves arrive on.
+        yields forever). Each frame: resolve BLE presence locally (see
+        ``_resolve_present_wristband``) and hand off to ``tick()``.
+        Runtime timestamps come from ``time.monotonic()``, the correct
+        clock here (unlike ``irix.demo.run_upload``'s ``frame_index /
+        fps``) since this is genuinely live: frame arrival time *is*
+        wall-clock time for a live camera, and BLE presence/timeout logic
+        has to be measured against the same clock the radio readings
+        themselves arrive on.
         """
-        estimator = self._ensure_estimator()
-        frame_count = 0
         for frame in self.frame_source.frames(max_frames=max_frames):
             now = self._clock()
-            frame_count += 1
-
             present_wristband_id = self._resolve_present_wristband()
-
-            if present_wristband_id is not None:
-                if self._active_wristband_id is not None and present_wristband_id != self._active_wristband_id:
-                    # someone else showed up while a session was active --
-                    # end the previous one first rather than silently
-                    # attributing their reps to whoever was here before.
-                    self._end_session(end_ts=self._last_seen_ts or now)
-                if self._active_session is None:
-                    self._start_session(present_wristband_id)
-                self._last_seen_ts = now
-            elif self._active_session is not None and self._last_seen_ts is not None:
-                if now - self._last_seen_ts >= self.presence_timeout_s:
-                    self._end_session(end_ts=self._last_seen_ts)
-
-            if self._active_session is None:
-                continue
-
-            if self._active_imu_stream is not None:
-                self._active_session.add_imu_samples(self._active_imu_stream.poll())
-
-            people = estimator.estimate(frame)
-            person = people[0] if people else None
-            self._on_events(self._active_session.process_frame(frame, now, person))
+            self.tick(frame, now, present_wristband_id)
 
     def close(self) -> None:
         """Flush the active session (if any) and release the frame

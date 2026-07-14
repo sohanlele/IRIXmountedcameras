@@ -219,6 +219,45 @@ plugs actual hardware into -- everything downstream of them (presence
 resolution, session lifecycle, rep counting, fusion, fatigue) is real,
 tested code today.
 
+**Multiple stations at once**: a lone `StationSessionRunner` only knows
+about its own station -- two adjacent ones would each independently start
+a session for the same band mid-walk between them, double-counting reps.
+`irix.live.gym_runner.GymSessionRunner` wires in the same station-handoff
+hysteresis `run_gym_demo.py` already demonstrates with synthetic data
+(`irix.topology.handoff.GymCoordinator`), for real: it resolves presence
+*gym-wide* from one raw BLE reading source, decides which single station
+is authoritative for each checked-out member, and only tells that
+station's `RepSession` about them.
+
+```python
+from irix.live.gym_runner import GymSessionRunner
+from irix.topology.registry import StationInfo, StationRegistry
+
+registry = StationRegistry([
+    StationInfo(station_id="squat-1", camera_id="cam-1", zone="free_weights", adjacent_station_ids=["squat-2"]),
+    StationInfo(station_id="squat-2", camera_id="cam-2", zone="free_weights", adjacent_station_ids=["squat-1"]),
+])
+station_runners = {
+    "squat-1": StationSessionRunner(station_id="squat-1", ..., ble_reader=lambda: []),  # not used -- gym runner drives tick() directly
+    "squat-2": StationSessionRunner(station_id="squat-2", ..., ble_reader=lambda: []),
+}
+gym = GymSessionRunner(
+    registry=registry,
+    checkout_registry=registry_of_checkouts,
+    station_runners=station_runners,
+    ble_reader=my_gym_wide_ble_reader,  # every station's readings, every band, in one call -- real hardware integration
+    on_gym_events=push_station_handoff_events,
+)
+gym.run_forever()
+```
+
+Not wired in yet, a separate problem: two different checked-out members
+whose bands both resolve to the *same* crowded station, which RSSI
+proximity alone can't tell apart -- that needs `GymCoordinator.
+disambiguate_by_motion` (camera wrist motion vs. wristband IMU
+correlation, already built and tested, just not connected to
+`GymSessionRunner` yet).
+
 ## Test
 
 ```bash
@@ -239,7 +278,7 @@ irix/
   barbell/             self-calibrated (no environment edits) barbell/plate/dumbbell tracking, m/s bar velocity, RPE/velocity-loss estimation
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, geometric plate-count cross-check, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
   pipeline/           edge buffer -> aggregator -> cloud sync; structured CameraEvent family (the API contract with irix-mvp-app); rep_session.py is the per-member pipeline (rep/form/weight/barbell/fatigue) shared by run_upload and the live station runner
-  live/               24/7-station pieces: camera_source.py (ReconnectingFrameSource, reconnects on drop instead of exiting) and station_runner.py (StationSessionRunner -- ties checkout + BLE presence + live camera + live IMU + RepSession into one continuously-running station)
+  live/               24/7-station pieces: camera_source.py (ReconnectingFrameSource, reconnects on drop instead of exiting), station_runner.py (StationSessionRunner -- ties checkout + BLE presence + live camera + live IMU + RepSession into one continuously-running station), gym_runner.py (GymSessionRunner -- runs several stations together with GymCoordinator-backed handoff so a member walking between them is never double-counted)
   demo/               single-station (run_demo.py), multi-station (run_gym_demo.py), and upload-mode (run_upload.py -- real video + real wristband file in, full event stream out) end-to-end CLIs
 tests/                 unit + smoke tests for every module above
 docs/ARCHITECTURE.md   design-doc-to-repo section map, including every place this repo diverges from the original design doc and why

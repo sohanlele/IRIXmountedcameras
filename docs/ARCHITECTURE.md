@@ -904,6 +904,52 @@ in production (same boundary -- radio-stack/firmware, not software-
 scaffold scope). Both have a settled interface to build against once
 that hardware work happens.
 
+**Multiple stations, live.** Everything above is scoped to one station.
+That's wrong for the real 10-camera target the same way a single
+`RepSession` was wrong for a whole gym floor: two adjacent stations, each
+independently resolving BLE presence from only their own local view,
+would both start a session for the same band mid-walk between them --
+the exact double-counting problem `irix.topology.handoff.GymCoordinator`
+already solves for the synthetic multi-station demo (`run_gym_demo.py`),
+just never connected to anything live before now.
+
+`StationSessionRunner` gained a `tick(frame, now, present_wristband_id)`
+method, splitting "resolve who's present" from "given a resolution, do
+the frame's work" -- `run_forever` still resolves presence locally
+(unchanged behavior, existing tests pass unmodified), but `tick()` is now
+also callable directly with an externally-resolved presence.
+
+`irix.live.gym_runner.GymSessionRunner` is that external resolver: it
+owns one `GymCoordinator` and one `CheckoutRegistry` shared across every
+station, pulls one frame from each station per gym-wide tick, resolves
+presence for every checked-out band from a single raw BLE reading source
+(`GymCoordinator.update_member`, same hysteresis logic `run_gym_demo.py`
+already exercises with synthetic readings -- `min_consecutive` readings
+favoring a different station before an actual handoff, not on every RSSI
+flicker), and calls each station's `tick()` with only the member
+`GymCoordinator.active_members_at(station_id)` says is actually
+authoritative there. A member's session at their old station closes the
+same way any absence does (`presence_timeout_s`, per member, tracked
+gym-wide) once `GymCoordinator` re-resolves them to a different station --
+no separate "handoff" code path needed in `StationSessionRunner` itself,
+the existing absence-timeout logic already does the right thing once fed
+the right presence signal. `tests/test_gym_runner.py` verifies this end
+to end with a scripted walk between two stations: exactly one
+`StationHandoffEvent`, exactly one `SetCompleteEvent` closed out at each
+station (proof the session actually moved, not merged or dropped), and a
+separate test with two members at two different stations simultaneously
+proving no cross-contamination.
+
+Deliberately still not wired in: `GymCoordinator.disambiguate_by_motion`
+(camera wrist motion vs. wristband IMU correlation, `irix.identity.
+motion_correlation`) for the *different* problem of two checked-out
+members' bands both resolving to the *same* crowded station -- RSSI
+proximity alone can't tell them apart, and `GymSessionRunner` doesn't
+attempt to yet. Already built and tested (`run_gym_demo.py` demonstrates
+it against synthetic candidates); connecting it to `GymSessionRunner` is
+a real next increment, not a hardware dependency like the BLE/IMU stubs
+above.
+
 ## End-to-end demo
 
 Two demo entrypoints, covering the two things worth demonstrating
