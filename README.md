@@ -159,6 +159,66 @@ this repo (see `docs/ARCHITECTURE.md`'s "Model weights" section) -- left
 off by default, in which case reps fall back to the deg/s joint-angle
 velocity proxy instead of calibrated m/s + RPE.
 
+### Live mode: structured for a 24/7 station, a front-desk checkout, and a live wristband
+
+The real deployment target isn't a video file -- it's a camera that's
+always on, and a wristband that gets checked out at the front desk and
+tied to an account before anyone's IMU data means anything. Neither
+`run_upload.py` (one file, one member, start to finish) nor `run_live`
+(exits when its source runs out, no concept of *whose* session it's
+watching) is the right shape for that. Four pieces close that gap in the
+software (the actual BLE radio stack and wristband firmware are hardware/
+firmware scope, same boundary `irix.identity.ble_pairing`'s docstring
+already draws -- these are the software-side interfaces that plug into
+real hardware once it exists):
+
+- `irix.identity.checkout.CheckoutRegistry` -- the front-desk step: check
+  a wristband out to an account, check it back in, resolve a wristband id
+  to a member id. Real and complete.
+- `irix.fusion.imu_stream.IMUStream` -- a `poll()`-based protocol so live
+  and recorded IMU data can be consumed identically. `RecordedIMUStream`
+  (real) wraps an already-loaded file; `LiveBLEIMUStream` is a documented
+  stub -- same reasoning as `LocalVLMBackend` staying unimplemented,
+  which real BLE client library/wristband protocol to use is a hardware
+  decision this scaffold can't make correctly by guessing.
+- `irix.live.camera_source.ReconnectingFrameSource` -- wraps
+  `cv2.VideoCapture` (webcam index, file, or a live stream URL -- the
+  same `source` `run_live` already accepts) and reconnects with
+  exponential backoff on any read failure instead of exiting. Real,
+  tested against a fake capture that fails on cue.
+- `irix.live.station_runner.StationSessionRunner` -- the orchestrator:
+  resolves BLE presence to a checked-out account via `CheckoutRegistry`,
+  starts a fresh `irix.pipeline.rep_session.RepSession` (the same
+  per-member logic `run_upload` uses, factored out so both share it) when
+  a checked-out member shows up, feeds it frames and live IMU samples for
+  as long as they're present, and closes it out (flushing whatever set
+  was in progress) once presence lapses past `presence_timeout_s`.
+
+```python
+from irix.identity.checkout import CheckoutRegistry
+from irix.live.camera_source import ReconnectingFrameSource
+from irix.live.station_runner import StationSessionRunner
+
+registry = CheckoutRegistry()
+registry.check_out("band-042", member_id="acct_123", timestamp=...)  # front desk
+
+runner = StationSessionRunner(
+    station_id="squat-1",
+    exercise_name="squat",
+    checkout_registry=registry,
+    frame_source=ReconnectingFrameSource("rtsp://squat-1-camera/stream"),
+    ble_reader=my_ble_reader,       # returns this station's current BLEReadings -- real hardware integration
+    imu_stream_factory=my_imu_factory,  # wristband_id -> IMUStream -- real hardware integration
+    on_events=push_to_aggregator,   # e.g. irix.pipeline.aggregator.Aggregator
+)
+runner.run_forever()  # runs indefinitely, one station, all day
+```
+
+`ble_reader` and `imu_stream_factory` are the two seams a real deployment
+plugs actual hardware into -- everything downstream of them (presence
+resolution, session lifecycle, rep counting, fusion, fatigue) is real,
+tested code today.
+
 ## Test
 
 ```bash
@@ -172,13 +232,14 @@ irix/
   pose/              pose estimation (YOLO-Pose wrapper) + joint-angle geometry
   rep_counting/       joint-angle state machine + per-exercise configs; each rep carries duration + peak/mean velocity for fatigue tracking, tracking_confidence for fusion, and optionally the buffered poses for form scoring
   form/               rule-based per-rep fault detection (knee valgus, insufficient depth, leaning back, elbow drift, hips-rising-before-chest), populates RepCompletedEvent.form_score/form_faults
-  fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters; rep_fusion.py reconciles camera + IMU set-level rep counts into one authoritative count; imu_io.py loads a real recorded wristband export (CSV/JSON) into IMUSamples
+  fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters; rep_fusion.py reconciles camera + IMU set-level rep counts into one authoritative count; imu_io.py loads a real recorded wristband export (CSV/JSON) into IMUSamples; imu_stream.py is the live-vs-recorded IMUStream protocol (RecordedIMUStream real, LiveBLEIMUStream a documented hardware-scope stub)
   fatigue/             set + session-level fatigue analysis (velocity loss %, VL-zone classification, tempo drift, form trend) aggregated for irix-mvp-app's AI context
   topology/            multi-camera station registry (10-camera example layout) + BLE-hysteresis member handoff, gating which station's events are authoritative to prevent double-counting
-  identity/            BLE RSSI station-pairing heuristic + motion-correlation disambiguation (camera wrist motion vs. wristband IMU) for when two members' bands are both in range of one station
+  identity/            BLE RSSI station-pairing heuristic + motion-correlation disambiguation (camera wrist motion vs. wristband IMU) for when two members' bands are both in range of one station; checkout.py is the front-desk wristband-to-account link (CheckoutRegistry)
   barbell/             self-calibrated (no environment edits) barbell/plate/dumbbell tracking, m/s bar velocity, RPE/velocity-loss estimation
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, geometric plate-count cross-check, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
-  pipeline/           edge buffer -> aggregator -> cloud sync; structured CameraEvent family (the API contract with irix-mvp-app)
+  pipeline/           edge buffer -> aggregator -> cloud sync; structured CameraEvent family (the API contract with irix-mvp-app); rep_session.py is the per-member pipeline (rep/form/weight/barbell/fatigue) shared by run_upload and the live station runner
+  live/               24/7-station pieces: camera_source.py (ReconnectingFrameSource, reconnects on drop instead of exiting) and station_runner.py (StationSessionRunner -- ties checkout + BLE presence + live camera + live IMU + RepSession into one continuously-running station)
   demo/               single-station (run_demo.py), multi-station (run_gym_demo.py), and upload-mode (run_upload.py -- real video + real wristband file in, full event stream out) end-to-end CLIs
 tests/                 unit + smoke tests for every module above
 docs/ARCHITECTURE.md   design-doc-to-repo section map, including every place this repo diverges from the original design doc and why

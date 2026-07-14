@@ -25,6 +25,14 @@ class BLEReading:
     rssi: float          # dBm, less negative = stronger/closer
     timestamp: float
     recent_motion: bool = False  # True if this station's camera saw motion recently
+    # Which physical band this reading is from. Optional (defaults to
+    # None) because StationPairing.resolve() below never needed it -- its
+    # whole input is already "these are all readings for one already-known
+    # band, which station wins" -- but irix.live.station_runner needs it:
+    # a station's radio can see several different members' bands at once,
+    # so it has to know *which* reading belongs to *which* band before it
+    # can resolve that band to an account via irix.identity.checkout.
+    wristband_id: Optional[str] = None
 
 
 class StationPairing:

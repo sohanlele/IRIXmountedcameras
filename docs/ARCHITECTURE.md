@@ -809,6 +809,101 @@ of reach. `WeightConfirmedEvent` gained `geometry_consistent`/
 -- occluded view, or a non-barbell exercise), since "couldn't check" and
 "check failed" are different things worth keeping distinct.
 
+## Live station readiness: front-desk checkout, a 24/7 camera, a live wristband
+
+Everything above -- including `run_upload.py` -- assumes the inputs are
+already sitting on disk: a finished video file, maybe a finished IMU
+export. The actual production target is different in three ways that
+nothing in this repo modeled until now: cameras run continuously, not one
+video at a time; a wristband only means something once the front desk has
+checked it out to an account; and IMU access is supposed to start when a
+member's set starts, not be loaded from a file after the fact. This
+section is the software-side response to that -- deliberately scoped to
+what's genuinely buildable as pure software, with hardware-dependent
+pieces left as documented stubs rather than guessed at (same boundary
+`irix.identity.ble_pairing`'s own docstring already draws around the BLE
+radio stack).
+
+**`irix.identity.checkout.CheckoutRegistry`** is the piece that was
+missing entirely: every `member_id` anywhere in this repo, until now, was
+just a string a caller already had to know. A real station only ever
+observes a wristband's BLE identifier -- it has no idea whose account
+that is unless something recorded "the front desk handed this band to
+this account." `CheckoutRegistry.check_out`/`check_in`/`resolve_member`
+is that record: one active checkout per physical band at a time (mirrors
+a real front-desk band cabinet -- a band has to come back before it can
+go out again), with `resolve_member(wristband_id)` as the lookup a live
+station does before it's willing to attribute any event to an account.
+
+**`irix.fusion.imu_stream.IMUStream`** answers "how does a live band's
+IMU data actually get consumed, given it's arriving continuously instead
+of sitting in a file." A `poll()`-based protocol, same pattern as
+`VLMBackend`/`CloudSync` elsewhere in this repo: `RecordedIMUStream`
+(real) wraps an already-loaded list so `irix.demo.run_upload` and a live
+caller can share identical consumption code in `RepSession`;
+`LiveBLEIMUStream` is a documented stub -- which BLE client
+library/wristband firmware protocol a real device exposes is exactly the
+kind of hardware detail this scaffold has no way to guess at correctly,
+same reasoning `LocalVLMBackend` stayed unimplemented for. What's settled
+is the *shape* (`poll() -> List[IMUSample]`) a real implementation has to
+satisfy, so nothing downstream needs to change once one exists.
+
+**`irix.pipeline.rep_session.RepSession`** is a refactor, not new
+behavior: the per-member state (`RepCounter`, `FormScorer`,
+`VisionPlateClassifier`, `BarPathTracker`/`RPETracker`,
+`RestGapSetBoundaryDetector`, `SetFatigueAnalyzer`/
+`SessionFatigueTracker`) that `run_upload.run_upload()` used to construct
+and drive inline, against a whole video, for exactly one member, is now a
+class with `process_frame(frame, ts, person)` / `add_imu_samples(...)` /
+`close(end_ts)`. `run_upload` is now a thin driver around one
+`RepSession` for the length of a video file; `StationSessionRunner`
+(below) drives a *sequence* of `RepSession`s, one per member, for as long
+as each is actually present. Extracting this doesn't change what either
+one produces -- `run_upload`'s existing tests pass unchanged against the
+refactored version -- it just means the event-construction logic exists
+in exactly one place instead of needing to be kept in sync between two.
+
+**`irix.live.camera_source.ReconnectingFrameSource`** is the 24/7-camera
+piece. `cv2.VideoCapture` already accepts a live stream URL exactly like
+it accepts a file path or webcam index -- `run_live`'s `--source` never
+technically blocked live streams. What every existing frame loop actually
+gets wrong for a 24/7 station is what happens when a read *fails*: they
+all stop. A live RTSP feed genuinely drops sometimes (network blip,
+camera reboot, DHCP renewal); a station shouldn't go dark until someone
+notices and restarts the process. `ReconnectingFrameSource.frames()`
+yields indefinitely, releasing and reopening with exponential backoff on
+any open/read failure instead of raising -- real, tested logic (see
+`tests/test_camera_source.py`, which drives it against a fake capture
+object that fails on cue), independent of whether a real camera is
+available to test against.
+
+**`irix.live.station_runner.StationSessionRunner`** composes all of the
+above into what a real station actually runs: per frame tick, resolve
+which checked-out band (if any) this station's BLE reader currently sees
+(`irix.identity.ble_pairing.BLEReading` gained an optional
+`wristband_id` field for this -- `StationPairing`'s own station-selection
+job never needed to know *which* band a reading was for, since it's
+always called with one band's readings already; a station watching for
+*any* checked-out band showing up does need to know). A checked-out band
+showing up starts a fresh `RepSession` (and requests that band's live
+`IMUStream`); the band going quiet for `presence_timeout_s` closes it
+(flushing whatever set was in progress) -- the same "infer the boundary,
+don't wait to be told" spirit as `RestGapSetBoundaryDetector`, one level
+up: that class decides when a *set* ends within a session, this class
+decides when the *session* ends. `ble_reader` and `imu_stream_factory`
+are the two seams a real deployment plugs actual hardware into
+(`tests/test_station_runner.py` exercises everything downstream of those
+seams with fakes: presence starting/ending a session correctly attributed
+to the right account, an unchecked-out band never starting one, one
+member's session getting preempted the instant another checked-out
+member shows up rather than double-attributing events).
+
+What's still explicitly not built: the real `LiveBLEIMUStream` (needs
+real hardware to get right) and the real BLE reader a station would use
+in production (same boundary -- radio-stack/firmware, not software-
+scaffold scope). Both have a settled interface to build against once
+that hardware work happens.
+
 ## End-to-end demo
 
 Two demo entrypoints, covering the two things worth demonstrating
