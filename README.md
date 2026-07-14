@@ -56,7 +56,7 @@ irix/
   pose/              pose estimation (YOLO-Pose wrapper) + joint-angle geometry
   rep_counting/       joint-angle state machine + per-exercise configs
   fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters
-  weight_recognition/ QR/barcode plate reader (v1), vision classifier stub (v2), N-of-M read confirmation
+  weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
   identity/           BLE RSSI station-pairing heuristic
   pipeline/           edge buffer -> aggregator -> cloud sync, derived-metrics schema
   coaching/           rep/set coaching text + local TTS engine interface

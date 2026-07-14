@@ -1,9 +1,16 @@
-"""QR/barcode plate-sticker reader -- v1 weight recognition (Section 4.4).
+"""QR/barcode plate-sticker reader -- kept for reference, not deployable.
 
-A cheap, durable sticker on each plate that the camera reads directly:
-near-100% accurate, trivial to compute, and works from day one regardless
-of gym-specific plate branding or color. ``pyzbar`` is an optional
-dependency (see pyproject.toml `[qr]` extra).
+This was the original v1 weight-recognition plan (Section 4.4): a cheap,
+durable sticker on each plate that the camera reads directly. Near-100%
+accurate and trivial to compute, but it requires adding something to
+every plate in the gym -- which is an environment edit, and IRIX's
+install constraint is camera-only (nothing else about the gym floor can
+change). ``VisionPlateClassifier`` (vision_classifier.py) is the actual
+deployable path. This module is kept as a reference implementation and
+because the confirm/consistency pattern it doesn't need (QR reads are
+already near-deterministic) is a useful contrast against the VLM path,
+which does need it. ``pyzbar`` is an optional dependency (see
+pyproject.toml `[qr]` extra).
 """
 from __future__ import annotations
 
