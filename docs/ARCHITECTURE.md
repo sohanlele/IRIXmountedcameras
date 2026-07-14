@@ -46,7 +46,11 @@ run. They are not equally solved:
   Detector" dataset (92 labeled images, pretrained model available via
   their API) as a starting point, but actually fine-tuning or wiring up
   a hosted inference API is a real decision (account/API-key access,
-  cost, accuracy expectations) this repo hasn't made yet.
+  cost, accuracy expectations) this repo hasn't made yet. `irix/demo/
+  run_upload.py` accepts a `--barbell-model` pointed at a real checkpoint
+  and will wire it in (self-calibration, bar velocity, RPE, geometry
+  cross-check) once one exists; without it, reps fall back to the deg/s
+  joint-angle proxy.
 
 - **`irix.weight_recognition.vlm_backend.GeminiVLMBackend` (cloud) --
   real, verified, chosen path.** Structured JSON output via the actual
@@ -828,3 +832,34 @@ camera+IMU rep-count fusion (both the agreement and the occlusion-fallback
 path), set + session fatigue analysis, and the weight-recognition
 geometry cross-check, all in one runnable, deterministic trace across two
 members and three stations.
+
+`irix/demo/run_upload.py` is a third entrypoint, and a real gap it closes:
+neither of the two above takes an already-*recorded* video and wristband
+file and runs the real (non-mock) versions of every module against them.
+`run_demo.py --source` only ever wires pose -> rep -> form (no IMU
+fusion, weight recognition, or barbell velocity -- those only ever ran
+against `run_gym_demo.py`'s synthetic streams before this), and there was
+no code anywhere that parsed a real wristband export into `IMUSample`s at
+all. `run_upload.py` (see its own module docstring for the full picture)
+fixes both: `irix/fusion/imu_io.py` loads a real recorded wristband
+CSV/JSON export, and `run_upload()` wires pose -> rep -> form -> (if an
+IMU file was given) `RepCountFusion` -> a `RestGapSetBoundaryDetector`
+segmenting the continuous rep stream into sets (nothing hand-scripts set
+length here, unlike the mock demos) -> `SetFatigueAnalyzer`/
+`SessionFatigueTracker`, plus periodic weight recognition
+(`VisionPlateClassifier`, if a `VLMBackend` is supplied) and, if a real
+barbell-detector checkpoint is supplied (none is bundled -- see "Model
+weights" above), calibrated bar velocity/RPE upgrading the deg/s proxy.
+Output is the full `CameraEvent` JSON stream -- exactly the payload
+`irix-mvp-app`'s AI needs, per `irix/pipeline/schema.py`'s module
+docstring.
+
+One correctness detail worth calling out: `run_upload` derives frame
+timestamps from the video's own frame index and fps
+(`frame_index / fps`), not wall-clock processing time. `run_live`
+(`run_demo.py --source`) uses `time.monotonic()` instead, which is
+correct there because a live camera's frame arrival time *is* wall-clock
+time -- but for an uploaded file, how fast this machine happens to
+process each frame has nothing to do with the footage's actual timeline,
+and using wall-clock time here would silently misalign a real uploaded
+IMU file's timestamps against the video.

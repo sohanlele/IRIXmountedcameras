@@ -47,3 +47,45 @@ class BandPlacementTracker:
         )
         self._current = exercise.band_placement
         return event
+
+
+class RestGapSetBoundaryDetector:
+    """Detects a set boundary in a continuous stream of completed reps
+    from real footage -- the piece the mock demos never needed, since
+    they script a fixed number of reps and then hand-construct
+    ``SetCompleteEvent`` at the end (see ``irix.demo.run_demo``/
+    ``run_gym_demo``). A real uploaded video has no such script: nothing
+    tells the pipeline in advance where one set ends and the next begins,
+    so ``irix.demo.run_upload`` needs to infer it from the rep stream
+    itself.
+
+    The heuristic: if the gap since the previous completed rep exceeds
+    ``rest_gap_s``, the previous set is considered already closed. This
+    is deliberately simple -- a fixed threshold can't distinguish one
+    unusually slow rep from the start of a rest period -- but it is the
+    standard approach in wearable/video activity-segmentation work for
+    exactly this problem (an inter-event-gap / "epoch" threshold), and a
+    generous default (20s) comfortably separates within-set inter-rep
+    gaps (a few seconds, even at a slow tempo) from between-set rest
+    (typically 60s+, though configurable down for supersets or
+    back-to-back circuit work where rest is short).
+    """
+
+    def __init__(self, rest_gap_s: float = 20.0):
+        self.rest_gap_s = rest_gap_s
+        self._last_rep_ts: Optional[float] = None
+
+    def observe(self, rep_timestamp: float) -> bool:
+        """Call once per completed rep, in timestamp order. Returns True
+        if this rep follows a gap long enough that the *previous* set
+        should be treated as already closed -- the caller is responsible
+        for finalizing the previous set (using the previous rep's own
+        timestamp as its end) before folding this rep into a new one.
+        Always False for the first rep observed (nothing to compare
+        against yet)."""
+        is_boundary = self._last_rep_ts is not None and (rep_timestamp - self._last_rep_ts) >= self.rest_gap_s
+        self._last_rep_ts = rep_timestamp
+        return is_boundary
+
+    def reset(self) -> None:
+        self._last_rep_ts = None

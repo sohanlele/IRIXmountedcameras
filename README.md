@@ -121,6 +121,44 @@ python -m irix.demo.run_demo --mock-pose --exercise bicep_curl --with-form-scori
 Live mode (`--source`) scores form automatically, no flag needed -- it
 already gets a full pose from `PoseEstimator` every frame.
 
+### Upload mode: a recorded video + wristband file in, the full event stream out
+
+`run_demo.py --source` and `run_gym_demo.py` are the only other places a
+real (or fusion-real) result comes out of this repo, but neither takes an
+already-*recorded* video and wristband file and runs the full pipeline
+against them -- `--source` only ever wires pose -> rep -> form (no IMU
+fusion, weight recognition, barbell velocity, or fatigue), and
+`run_gym_demo.py` is synthetic-data-only. `run_upload.py` is that missing
+entrypoint: give it a video file (and, optionally, a wristband IMU
+export), and it runs every real module this repo has -- pose, rep
+counting, form scoring, IMU fusion, weight recognition, barbell velocity/
+RPE, fatigue analysis, and rest-gap set-boundary detection (nothing here
+hand-scripts where one set ends and the next begins, unlike the mock
+demos) -- and returns/writes the full `CameraEvent` JSON stream, the
+payload `irix-mvp-app`'s AI needs.
+
+```bash
+# video only (pose -> rep -> form -> rest-gap-detected sets -> fatigue)
+python -m irix.demo.run_upload --video squat.mp4 --exercise squat
+
+# + a real wristband IMU recording (see irix/fusion/imu_io.py for the
+# exact CSV/JSON format) -- reconciled against the camera count per set
+python -m irix.demo.run_upload --video squat.mp4 --exercise squat --imu wristband.csv
+
+# + weight recognition (needs a real Gemini API key you supply -- none is
+# bundled here)
+python -m irix.demo.run_upload --video squat.mp4 --exercise squat --gemini-api-key "$GEMINI_API_KEY"
+
+# write the JSON event stream to a file instead of stdout
+python -m irix.demo.run_upload --video squat.mp4 --exercise squat --out events.json
+```
+
+Barbell velocity/RPE (`--barbell-model path/to/checkpoint.pt`) needs a
+real trained barbell/plate detector checkpoint, which isn't bundled with
+this repo (see `docs/ARCHITECTURE.md`'s "Model weights" section) -- left
+off by default, in which case reps fall back to the deg/s joint-angle
+velocity proxy instead of calibrated m/s + RPE.
+
 ## Test
 
 ```bash
@@ -134,14 +172,14 @@ irix/
   pose/              pose estimation (YOLO-Pose wrapper) + joint-angle geometry
   rep_counting/       joint-angle state machine + per-exercise configs; each rep carries duration + peak/mean velocity for fatigue tracking, tracking_confidence for fusion, and optionally the buffered poses for form scoring
   form/               rule-based per-rep fault detection (knee valgus, insufficient depth, leaning back, elbow drift, hips-rising-before-chest), populates RepCompletedEvent.form_score/form_faults
-  fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters; rep_fusion.py reconciles camera + IMU set-level rep counts into one authoritative count
+  fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters; rep_fusion.py reconciles camera + IMU set-level rep counts into one authoritative count; imu_io.py loads a real recorded wristband export (CSV/JSON) into IMUSamples
   fatigue/             set + session-level fatigue analysis (velocity loss %, VL-zone classification, tempo drift, form trend) aggregated for irix-mvp-app's AI context
   topology/            multi-camera station registry (10-camera example layout) + BLE-hysteresis member handoff, gating which station's events are authoritative to prevent double-counting
   identity/            BLE RSSI station-pairing heuristic + motion-correlation disambiguation (camera wrist motion vs. wristband IMU) for when two members' bands are both in range of one station
   barbell/             self-calibrated (no environment edits) barbell/plate/dumbbell tracking, m/s bar velocity, RPE/velocity-loss estimation
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, geometric plate-count cross-check, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
   pipeline/           edge buffer -> aggregator -> cloud sync; structured CameraEvent family (the API contract with irix-mvp-app)
-  demo/               single-station (run_demo.py) and multi-station (run_gym_demo.py) end-to-end CLIs
+  demo/               single-station (run_demo.py), multi-station (run_gym_demo.py), and upload-mode (run_upload.py -- real video + real wristband file in, full event stream out) end-to-end CLIs
 tests/                 unit + smoke tests for every module above
 docs/ARCHITECTURE.md   design-doc-to-repo section map, including every place this repo diverges from the original design doc and why
 ```
