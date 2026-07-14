@@ -14,11 +14,11 @@ equipment the calibration never saw), this follows jeffreyjy/IrixDemo's
 approach: ask a vision-language model to read the scene directly. A VLM
 generalizes to whatever plates a given gym actually has without a
 calibration step, the same way it generalized to reading a printed number
-in their first-person case. See ``vlm_backend.py`` for why the backend
-here defaults to a local/on-device model rather than their cloud Gemini
-call, and ``confirmation.py`` for the N-of-M read-confirmation logic
-(ported from the same source) that keeps a single noisy VLM read from
-being trusted outright.
+in their first-person case. ``backend`` is a ``VLMBackend`` (see
+``vlm_backend.py`` for the cloud-vs-local tradeoff and why cloud Gemini
+was chosen), and ``confirmation.py`` has the N-of-M read-confirmation
+logic (ported from the same source) that keeps a single noisy VLM read
+from being trusted outright.
 """
 from __future__ import annotations
 

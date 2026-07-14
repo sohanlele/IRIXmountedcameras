@@ -30,19 +30,23 @@ auto-downloading pretrained checkpoint (`yolov8n-pose.pt`, COCO
 keypoints) and is verified end-to-end against a real image and video in
 `tests/test_pose_estimator_integration.py` -- generic human pose
 estimation is a solved, commodity problem, not something this project
-needs to train. Barbell/plate detection
-(`irix.barbell.detector.FreeWeightDetector`) and the local VLM backend
-(`irix.weight_recognition.vlm_backend.LocalVLMBackend`) are still
-untrained stubs -- there's no free commodity equivalent for either (see
-their module docstrings for what a real fix looks like for each).
+needs to train. Weight recognition uses `GeminiVLMBackend` (cloud), a
+real integration verified against the current `google-genai` SDK -- no
+API key is bundled here, the deployer supplies their own. Barbell/plate
+detection (`irix.barbell.detector.FreeWeightDetector`) and the local VLM
+backend (`irix.weight_recognition.vlm_backend.LocalVLMBackend`) are still
+untrained/unimplemented stubs, left deferred by choice -- see their
+module docstrings and `docs/ARCHITECTURE.md`'s "Model weights" section
+for what a real fix looks like for each.
 
 ## Install
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt      # numpy, opencv, ultralytics, pyzbar, pytest
-# or, for a lighter install without live pose inference / QR reading:
-pip install -e .
+pip install -r requirements.txt      # numpy, opencv, ultralytics, pyzbar, google-genai, pytest
+# or, for a lighter install (pick only the extras you need):
+pip install -e .                     # core only
+pip install -e ".[pose,qr,vlm,dev]"  # + real pose inference, QR reading, GeminiVLMBackend, tests
 ```
 
 ## Run the demo

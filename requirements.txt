@@ -5,5 +5,8 @@ scipy>=1.11
 ultralytics>=8.1
 # Optional, needed only for QR/barcode plate reading (Section 4.4).
 pyzbar>=0.1.9
+# Optional, needed only for GeminiVLMBackend (Section 4.4 weight recognition).
+# No API key is bundled here -- the deployer supplies GeminiVLMBackend(api_key=...).
+google-genai>=1.0
 # Dev/test
 pytest>=7.4

@@ -48,18 +48,34 @@ run. They are not equally solved:
   a hosted inference API is a real decision (account/API-key access,
   cost, accuracy expectations) this repo hasn't made yet.
 
+- **`irix.weight_recognition.vlm_backend.GeminiVLMBackend` (cloud) --
+  real, verified, chosen path.** Structured JSON output via the actual
+  `google-genai` SDK, checked against the current API (not sketched from
+  memory): inline frame bytes go through `types.Part.from_bytes(...)`,
+  and `_LOAD_READ_SCHEMA`'s lowercase JSON Schema is passed under
+  `response_json_schema` (not `response_schema`, which expects a
+  Pydantic model or Gemini's own uppercase-typed schema dialect and would
+  silently mis-parse a plain lowercase dict). `tests/
+  test_gemini_vlm_backend.py` mocks `_load_client()` and asserts the real
+  `google.genai.types.Part`/config shapes are constructed correctly and
+  the response is parsed correctly -- no live network call, no API key
+  used. **No API key is bundled or hardcoded anywhere in this repo**;
+  `api_key` is a required constructor argument the deployer supplies.
+  Chosen over `LocalVLMBackend` because a call only happens per weight
+  *change* during the confirm window (a few times per set, not per
+  frame/rep), so the volume of frames leaving the building is small
+  relative to the cost of standing up on-device model serving -- see
+  "Weight recognition" below for the full tradeoff.
+
 - **`irix.weight_recognition.vlm_backend.LocalVLMBackend` -- still a
-  stub.** Raises `NotImplementedError`. The recommended default backend
-  (local-preferred over cloud, see "Weight recognition" below for why),
-  but implementing it for real means picking and integrating an actual
-  local VLM (e.g. a small open-weights model run via `transformers` or
-  `ollama`) -- again a real decision about model choice, latency/
-  hardware tradeoffs, and whether CPU inference on an edge box is even
-  fast enough, not something to guess at without a target device to
-  benchmark against. `GeminiVLMBackend` (cloud) has real integration
-  code and is usable today if a live cloud round-trip per read is
-  acceptable; it's just not the recommended production default per the
-  data-minimization reasoning in "Weight recognition" below.
+  stub, left deferred by choice.** Raises `NotImplementedError`.
+  Implementing it for real means picking and integrating an actual local
+  VLM (e.g. a small open-weights model run via `transformers` or
+  `ollama`) -- a real decision about model choice, latency/hardware
+  tradeoffs, and whether CPU inference on an edge box is even fast
+  enough, not something to guess at without a target device to
+  benchmark against. Revisit if the privacy/uptime tradeoff that
+  currently favors cloud stops being acceptable for a given deployment.
 
 ## Where this repo ends and irix-mvp-app begins
 
@@ -471,16 +487,25 @@ trusted outright, same role it plays for the IMU counters above.
 
 Where this repo diverges from theirs: `vlm_backend.py` makes the model
 backend pluggable rather than hardcoding a cloud call. `GeminiVLMBackend`
-mirrors their actual approach (useful for parity/demo purposes), but
+(cloud) is the chosen, real, verified path -- see "Model weights" above
+for exactly what "verified" means here. This is a real tradeoff decided
+explicitly rather than a default accepted quietly: a cloud VLM call means
+camera frames leave the building, which is in tension with Section 8's
+data-minimization stance (raw video never leaves the building). It was
+chosen anyway because `VisionPlateClassifier` only calls the backend
+during the confirm window at station setup -- a few calls per set, not
+per frame or per rep -- so the volume of frames actually leaving the
+building is small, and it avoids standing up and maintaining on-device
+model-serving infrastructure on the zone edge box for that low call
+volume. No API key is bundled or hardcoded in this repo; a deployer
+supplies their own via `GeminiVLMBackend(api_key=...)`.
 `LocalVLMBackend` -- an on-device open-source VLM served on the zone edge
-box -- is the recommended default, because a cloud VLM call means camera
-frames leave the building on every read, which conflicts with Section 8's
-data-minimization stance (raw video never leaves the building) and adds a
-per-call cost + network dependency at every station. `LocalVLMBackend` is
-an interface sketch (`NotImplementedError`), not a finished integration --
-which local model/serving stack to run on the Jetson boxes from Section 6
-is a real decision that needs actual hardware to validate, not something
-to guess at in a software scaffold.
+box, which would close the frames-never-leave-the-building gap -- remains
+an interface sketch (`NotImplementedError`), left deferred rather than
+guessed at: which local model/serving stack to run on the Jetson boxes
+from Section 6 is a real decision that needs actual hardware to
+benchmark, and is worth revisiting if the tradeoff above stops holding
+for a given deployment.
 
 `tests/test_vision_classifier.py` exercises the confirmation-windowing
 logic against a scripted `FakeVLMBackend` -- no real model call needed to
