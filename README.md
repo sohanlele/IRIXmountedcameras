@@ -36,6 +36,13 @@ With a real webcam or video file (requires `pip install irix[pose]`):
 python -m irix.demo.run_demo --source 0 --exercise bicep_curl
 ```
 
+With the wristband IMU cross-check (camera-based count vs. two independent
+IMU-only counters on a synthetic wristband signal):
+
+```bash
+python -m irix.demo.run_demo --mock-pose --exercise squat --with-imu-crosscheck
+```
+
 ## Test
 
 ```bash
@@ -48,8 +55,8 @@ pytest
 irix/
   pose/              pose estimation (YOLO-Pose wrapper) + joint-angle geometry
   rep_counting/       joint-angle state machine + per-exercise configs
-  fusion/             visual-inertial EKF + ZUPT dead-stop correction
-  weight_recognition/ QR/barcode plate reader (v1), vision classifier stub (v2)
+  fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters
+  weight_recognition/ QR/barcode plate reader (v1), vision classifier stub (v2), N-of-M read confirmation
   identity/           BLE RSSI station-pairing heuristic
   pipeline/           edge buffer -> aggregator -> cloud sync, derived-metrics schema
   coaching/           rep/set coaching text + local TTS engine interface

@@ -1,5 +1,6 @@
 numpy>=1.24
 opencv-python-headless>=4.8
+scipy>=1.11
 # Optional, needed only for real pose inference (Section 4.1). Heavy (pulls in torch).
 ultralytics>=8.1
 # Optional, needed only for QR/barcode plate reading (Section 4.4).
