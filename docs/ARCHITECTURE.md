@@ -1276,3 +1276,117 @@ time -- but for an uploaded file, how fast this machine happens to
 process each frame has nothing to do with the footage's actual timeline,
 and using wall-clock time here would silently misalign a real uploaded
 IMU file's timestamps against the video.
+
+## Software wristband + BLE gateway simulator (2026-07-14)
+
+Every piece of "Live station readiness" above (`StationSessionRunner`,
+`GymSessionRunner`) had real, tested logic behind it, but only ever run
+against hand-built fakes inside unit tests -- no demo drove the actual
+tick-loop live orchestration end to end the way a real deployment would.
+That's a real gap against this project's stated final goal ("simulate or
+connect multiple wristbands," "recover from BLE disconnects"), and a
+different problem from the one `irix.fusion.imu_stream.LiveBLEIMUStream`
+deliberately leaves unimplemented: that stub is unimplemented because
+*real* BLE hardware/firmware protocol choice can't be guessed at
+correctly from a software scaffold. A *simulator* has no such excuse --
+it exists precisely to stand in for hardware that doesn't exist yet, so
+this was worth building now rather than deferring further.
+
+`irix/wristband_sim/simulator.py` adds two classes:
+
+- `SimulatedWristband` -- one simulated physical band: a `station_id`
+  (ground truth of where its wearer physically is, set directly by a
+  test/demo script, never exposed to the pipeline being tested) and a
+  continuous IMU generator (`advance(dt) -> List[IMUSample]`) with a
+  settable motion program (`"idle"`: gravity + a fixed, known bias +
+  noise; `"reps"`: the same oscillating-vertical-accel model
+  `irix.demo.mock_pose.synthetic_imu_stream` already uses, so downstream
+  consumers see consistent statistics regardless of source). The bias is
+  deliberately nonzero and fixed per instance so
+  `irix.wristband_sim.calibration.calibrate_stationary` has something
+  real to recover, rather than trivially calibrating against a
+  already-zero-bias signal.
+- `SimulatedBLEGateway` -- owns N wristbands, ticked once per gym-wide
+  loop iteration (`tick(now)`). Produces `irix.identity.ble_pairing.
+  BLEReading`s (RSSI + Gaussian noise, station-appropriate) via
+  `ble_reader()` -- the exact callable shape `GymSessionRunner`'s/
+  `StationSessionRunner`'s `ble_reader` constructor arg expects -- and
+  buffers each present band's IMU samples, drained through
+  `SimulatedBLEIMUStream` (implements `irix.fusion.imu_stream.IMUStream`)
+  via `imu_stream_factory(wristband_id)`. `packet_loss_pct` independently
+  drops some fraction of both BLE readings and IMU packets per tick (a
+  real radio genuinely loses some of each, transmitted on separate
+  channels/characteristics). `disconnect(wristband_id, ticks)` schedules
+  a scheduled total dropout -- no BLE reading, no IMU samples -- for
+  exercising the disconnect-survives-past-`presence_timeout_s` grace
+  period this project's final goal explicitly calls for, against the
+  real live pipeline rather than asserting the reconnect logic exists in
+  isolation.
+
+  One implementation detail worth being explicit about: whether a
+  disconnected tick is skipped in `ble_reader()` is tracked via a
+  `_disconnected_this_tick` set computed once in `tick()`, not by
+  re-checking the (already-decremented) countdown dict from inside
+  `ble_reader()` -- checking the post-decrement value directly would
+  under-count the disconnect by one tick (the countdown reaches zero on
+  the *last* disconnected tick, at which point a naive `> 0` check would
+  already read false). Caught by
+  `tests/test_wristband_simulator.py::test_gateway_disconnect_drops_ble_and_imu_for_scheduled_ticks`,
+  which asserts both ticks of a 2-tick disconnect are actually dropped,
+  not just the first.
+
+`irix/wristband_sim/calibration.py` adds
+`calibrate_stationary(samples) -> IMUCalibration`: standard strapdown-IMU
+static calibration (gyro bias = mean gyro during a stationary period,
+since true angular velocity is exactly zero; accel bias = mean accel
+minus expected gravity along whichever axis is "up") and
+`apply_calibration`/`apply_calibration_batch` to subtract it back out.
+Deliberately just bias, not a full multi-orientation scale-factor/
+cross-axis-misalignment calibration (which needs a turntable or several
+known orientations) -- unnecessary precision for a wrist-worn
+consumer-grade IMU doing rep counting rather than dead-reckoning
+navigation, where the practically visible failure mode (a stationary
+band's gyro integrating into phantom motion) is fixed by bias correction
+alone.
+
+`irix/demo/synthetic_live.py` adds the last piece needed to actually
+drive `StationSessionRunner.tick()`/`GymSessionRunner.run_forever()` with
+synthetic data: `SyntheticFrameSource` (a `.frames()`/`.close()`
+drop-in for `ReconnectingFrameSource`, yielding placeholder arrays --
+real pixel content is only needed if whatever's paired with it as
+`pose_estimator` actually looks at it) and `SyntheticPoseEstimator`
+(ignores the frame it's given, instead replaying a pre-generated
+`irix.demo.mock_pose.synthetic_pose_stream` sequence, looping once
+exhausted since a live station keeps ticking past any fixed-length demo
+sequence).
+
+`irix/demo/run_live_gym_demo.py` (`python -m irix.demo.run_live_gym_demo`)
+wires all of the above into the first demo that runs the real
+`StationSessionRunner`/`GymSessionRunner` classes rather than
+`run_gym_demo.py`'s pattern of calling rep-counting/fusion code directly
+against synthetic streams: two members, two adjacent stations
+(`squat-1`/`squat-2`), checked out via a real `CheckoutRegistry`, a
+scripted timeline (Alice starts a set at squat-1; a short BLE disconnect
+that's shorter than `presence_timeout_s` and should be survived
+transparently; Bob walks up to squat-2, does a set, and leaves; Alice
+then walks from squat-1 to squat-2, producing a real
+`StationHandoffEvent` through `GymCoordinator`), and every event pushed
+through `irix.pipeline.edge_buffer.LocalBuffer` ->
+`irix.pipeline.aggregator.Aggregator` ->
+`irix.pipeline.cloud_sync.InMemoryCloudSync` -- the mock-backend delivery
+path a real deployment's `HTTPCloudSync` would replace.
+`tests/test_run_live_gym_demo.py` asserts the run actually produces every
+claimed event type (rep completion, set completion, fatigue summary, and
+the one expected station handoff with the correct member/from/to), not
+just that it executes without raising.
+
+**What this does and doesn't close.** This makes the live orchestration
+path (presence resolution, session lifecycle, handoff, disconnect
+recovery, mock-backend delivery) genuinely exercised end to end for the
+first time, in CI, without hardware. It does not implement
+`irix.fusion.imu_stream.LiveBLEIMUStream` itself -- that remains correctly
+unimplemented, for the same hardware-dependency reason stated throughout
+this document. What changes is that once real wristband hardware and its
+BLE protocol exist, wiring in a real `LiveBLEIMUStream` subclass and a
+real `ble_reader` is the *only* new work required -- everything else in
+the live path this simulator now exercises stays as-is.

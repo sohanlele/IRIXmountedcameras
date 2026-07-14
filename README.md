@@ -302,6 +302,51 @@ not just tolerant of losing sight of the person entirely. See
 `docs/ARCHITECTURE.md`'s "Overlapping multi-camera zones" section for the
 full reasoning on all of the above.
 
+**Simulated live gym demo (no camera, no wristband hardware, no model
+weights)**: everything above in this section (`StationSessionRunner`,
+`GymSessionRunner`) had real, tested logic but no demo driving it
+end-to-end before now -- every existing demo either calls
+`RepCounter`/fusion code directly (`run_demo.py`, `run_gym_demo.py`) or
+replays an already-finished file (`run_upload.py`); none of them
+exercised the actual tick-loop live orchestration. `irix.wristband_sim`
+closes that gap in pure software: `SimulatedBLEGateway` generates
+`BLEReading`s and `IMUStream`-compatible IMU samples for any number of
+`SimulatedWristband`s, with configurable BLE packet loss and a
+`disconnect(wristband_id, ticks)` call for scripting a radio dropout --
+the same shapes `ble_reader`/`imu_stream_factory` above expect from real
+hardware, so `StationSessionRunner`/`GymSessionRunner` run unmodified
+against it. `irix.wristband_sim.calibration.calibrate_stationary`
+recovers a wristband's accel/gyro bias from a short stationary sample
+batch (standard strapdown-IMU static calibration), the step a real band
+needs before its IMU data means anything to `irix.fusion`.
+
+```bash
+python -m irix.demo.run_live_gym_demo
+```
+
+Two members, two adjacent stations, one scripted run: Alice starts a
+squat set at squat-1; her band suffers a short BLE disconnect
+(shorter than `presence_timeout_s`) and recovers with no session loss;
+Bob then walks up to squat-2, does a set, and leaves; Alice then walks
+from squat-1 to squat-2, producing a real `StationHandoffEvent` through
+`GymCoordinator` -- the same handoff logic `run_gym_demo.py` demonstrates
+with directly-injected synthetic BLE readings, here reached through the
+actual live tick loop instead. Events are pushed through
+`irix.pipeline.edge_buffer.LocalBuffer` -> `irix.pipeline.aggregator.
+Aggregator` -> `irix.pipeline.cloud_sync.InMemoryCloudSync`, the same
+mock-backend delivery path a real deployment's `HTTPCloudSync` would
+replace.
+
+`irix.fusion.imu_stream.LiveBLEIMUStream` -- the real-hardware
+counterpart `irix.wristband_sim.simulator.SimulatedBLEIMUStream` stands
+in for above -- stays an unimplemented stub, same reasoning as before: which BLE GATT client
+library and wristband firmware protocol a real device exposes is a
+hardware decision, not something a software simulator should guess at.
+What the simulator buys is everything *else* in the live path -- station
+orchestration, handoff, disconnect recovery, mock-backend delivery --
+genuinely exercised today, so none of that has to be built or debugged
+for the first time once real wristband hardware exists.
+
 ## Test
 
 ```bash
@@ -323,7 +368,8 @@ irix/
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, geometric plate-count cross-check, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
   pipeline/           edge buffer -> aggregator -> cloud sync; structured CameraEvent family (the API contract with irix-mvp-app); rep_session.py is the per-member pipeline (rep/form/weight/barbell/fatigue) shared by run_upload and the live station runner
   live/               24/7-station pieces: camera_source.py (ReconnectingFrameSource, reconnects on drop instead of exiting), disambiguation.py (CrowdedGroupDisambiguator -- one detection source's pose/IMU-buffering + motion-correlation resolution, shared by station_runner.py and zone_runner.py), station_runner.py (StationSessionRunner -- ties checkout + BLE presence + live camera + live IMU + RepSession into one continuously-running station, one camera per station), gym_runner.py (GymSessionRunner -- runs several stations together with GymCoordinator-backed handoff so a member walking between them is never double-counted), zone_runner.py (MultiCameraZoneRunner -- several cameras with overlapping fields of view over one shared area, segregating multiple co-located members via wristband-IMU correlation per camera rather than pixel-level cross-camera re-identification)
-  demo/               single-station (run_demo.py), multi-station (run_gym_demo.py), and upload-mode (run_upload.py -- real video + real wristband file in, full event stream out) end-to-end CLIs
+  wristband_sim/       software BLE wristband + gateway simulator (SimulatedBLEGateway: multi-wristband BLE presence + IMU streaming, configurable packet loss, scriptable disconnects) and calibration.py (stationary accel/gyro bias calibration) -- the software-only stand-in for real wristband hardware, see "Simulated live gym demo" above
+  demo/               single-station (run_demo.py), multi-station (run_gym_demo.py), upload-mode (run_upload.py -- real video + real wristband file in, full event stream out), and live-gym-mode (run_live_gym_demo.py -- irix.wristband_sim-backed StationSessionRunner/GymSessionRunner run, no hardware needed) end-to-end CLIs; synthetic_live.py (SyntheticFrameSource/SyntheticPoseEstimator) is what lets the live orchestration classes run against synthetic data
 tests/                 unit + smoke tests for every module above
 docs/ARCHITECTURE.md   design-doc-to-repo section map, including every place this repo diverges from the original design doc and why
 ```
