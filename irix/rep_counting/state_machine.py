@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from .exercises import ExerciseConfig
 
@@ -30,6 +30,29 @@ class RepEvent:
     exercise: str
     timestamp: float
     duration_s: float  # time since the previous rep completed (or session start)
+    # Joint-angular velocity (deg/s) over the concentric (bottom -> top)
+    # phase of this rep -- a rep-speed *proxy*, not a calibrated linear
+    # bar velocity. That needs Section 4.5's barbell centroid tracking +
+    # per-station camera calibration, which isn't built yet (see
+    # irix.rep_counting.exercises and docs/ARCHITECTURE.md). None if too
+    # few samples were captured during the concentric phase to estimate
+    # (e.g. a very fast rep with a low-fps camera).
+    peak_angular_velocity_deg_s: Optional[float] = None
+    mean_angular_velocity_deg_s: Optional[float] = None
+
+
+def _phase_velocity(samples: List[Tuple[float, float]]) -> Tuple[Optional[float], Optional[float]]:
+    """(peak, mean) of |d(angle)/dt| across consecutive samples, deg/s."""
+    if len(samples) < 2:
+        return None, None
+    speeds = []
+    for (t0, a0), (t1, a1) in zip(samples, samples[1:]):
+        dt = t1 - t0
+        if dt > 0:
+            speeds.append(abs(a1 - a0) / dt)
+    if not speeds:
+        return None, None
+    return max(speeds), sum(speeds) / len(speeds)
 
 
 class RepCounter:
@@ -40,6 +63,13 @@ class RepCounter:
     rep was counted (a full concentric/eccentric traversal). Hysteresis
     bands around each threshold prevent sensor/pose noise from triggering
     spurious counts near a boundary.
+
+    While the angle is in the bottom-to-top (concentric) phase, every
+    sample is buffered so the completed ``RepEvent`` can report peak/mean
+    angular velocity alongside the rep count and inter-rep timing -- this
+    is what feeds fatigue trend tracking (e.g. velocity loss across a set)
+    on the irix-mvp-app side; this repo only supplies the numbers, not the
+    fatigue judgment itself.
     """
 
     def __init__(self, exercise: ExerciseConfig):
@@ -47,8 +77,15 @@ class RepCounter:
         self.state = RepState.TOP
         self.rep_count = 0
         self._last_rep_time: Optional[float] = None
-        self._session_start = time.monotonic()
+        # Lazily set from the first timestamp seen in update(), rather than
+        # time.monotonic() at construction: callers (tests, the mock demo,
+        # a real edge pipeline) each have their own timestamp convention,
+        # and comparing against wall-clock-at-construction produced a
+        # garbage duration_s on the very first rep whenever that
+        # convention didn't happen to match wall-clock monotonic time.
+        self._session_start: Optional[float] = None
         self._reached_bottom = False
+        self._concentric_samples: List[Tuple[float, float]] = []
 
     def _descending_is_decreasing(self) -> bool:
         """True if moving from top -> bottom means the angle is decreasing."""
@@ -59,6 +96,8 @@ class RepCounter:
         if angle != angle:  # NaN guard (occlusion / missed keypoint)
             return None
         ts = timestamp if timestamp is not None else time.monotonic()
+        if self._session_start is None:
+            self._session_start = ts
         cfg = self.exercise
         h = cfg.hysteresis
         descending_is_decreasing = self._descending_is_decreasing()
@@ -69,10 +108,16 @@ class RepCounter:
         if at_bottom:
             self._reached_bottom = True
             self.state = RepState.BOTTOM
+            # (Re)start the concentric-phase sample window from the bottom.
+            self._concentric_samples = [(ts, angle)]
             return None
 
         if at_top:
             if self._reached_bottom:
+                self._concentric_samples.append((ts, angle))
+                peak_v, mean_v = _phase_velocity(self._concentric_samples)
+                self._concentric_samples = []
+
                 self.rep_count += 1
                 duration = ts - (self._last_rep_time or self._session_start)
                 self._last_rep_time = ts
@@ -83,12 +128,17 @@ class RepCounter:
                     exercise=cfg.name,
                     timestamp=ts,
                     duration_s=duration,
+                    peak_angular_velocity_deg_s=peak_v,
+                    mean_angular_velocity_deg_s=mean_v,
                 )
             self.state = RepState.TOP
             return None
 
-        # Between thresholds: track direction loosely for observability only
-        # (does not affect counting correctness, which relies solely on
-        # _reached_bottom).
+        # Between thresholds: keep buffering concentric-phase samples if
+        # we're past the bottom (ascending toward top). Also track
+        # direction loosely for observability -- neither affects counting
+        # correctness, which relies solely on _reached_bottom.
+        if self._reached_bottom:
+            self._concentric_samples.append((ts, angle))
         self.state = RepState.DESCENDING if self.state in (RepState.TOP, RepState.DESCENDING) else RepState.ASCENDING
         return None

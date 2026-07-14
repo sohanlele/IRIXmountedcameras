@@ -60,7 +60,7 @@ pytest
 ```
 irix/
   pose/              pose estimation (YOLO-Pose wrapper) + joint-angle geometry
-  rep_counting/       joint-angle state machine + per-exercise configs
+  rep_counting/       joint-angle state machine + per-exercise configs; each rep carries duration + peak/mean velocity for fatigue tracking
   fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
   identity/           BLE RSSI station-pairing heuristic

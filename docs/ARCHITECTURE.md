@@ -29,10 +29,10 @@ is a placeholder pointed at wherever that endpoint ends up.
 | Design doc section | Repo module | Status |
 |---|---|---|
 | 4.1 Pose estimation model | `irix/pose/` | YOLO-Pose wrapper (`ultralytics`, optional dep); joint-angle geometry helper |
-| 4.2 Rep-counting logic | `irix/rep_counting/` | Joint-angle state machine + per-exercise configs (squat/curl/deadlift) |
+| 4.2 Rep-counting logic | `irix/rep_counting/` | Joint-angle state machine + per-exercise configs (squat/curl/deadlift/leg_press/hack_squat); each completed rep also carries inter-rep duration + peak/mean angular velocity for fatigue tracking (see below) |
 | 4.3 Multi-camera fusion & occlusion | -- | Not implemented; `PoseEstimator` returns single-view poses per camera, multi-view reprojection is future work |
 | 4.4 Weight & plate recognition | `irix/weight_recognition/` | VLM-based classifier (`vision_classifier.py`) is the deployable path -- see below for why QR stickers and OCR were both ruled out; `confirmation.py` adds N-of-M read-confirmation windowing |
-| 4.5 Bar path & velocity tracking | -- | Not implemented; would reuse `irix/pose` object-detection output for the barbell class |
+| 4.5 Bar path & velocity tracking | -- | Not implemented (calibrated linear bar velocity); `irix/rep_counting/state_machine.py` supplies a joint-angular-velocity *proxy* per rep in the meantime -- see "Rep velocity and fatigue tracking" below |
 | 4.6 Visual-inertial sensor fusion | `irix/fusion/` | EKF (position/velocity state) + ZUPT dead-stop correction; `imu_rep_counting.py` adds two literature IMU-only rep counters (see below) |
 | 5.1 BLE identity linking | `irix/identity/` | RSSI-based station-resolution heuristic (not a BLE radio stack) |
 | 5.4 Personalization data flow | -- | Not implemented; would live alongside `irix/pipeline` as a profile-pull step |
@@ -67,6 +67,52 @@ Two things are worth being explicit about:
   dumbbell via a prompt-engineered `extraction_state` (N-of-M confirm
   window + a `validate_weight_lbs` range/grid validator) rather than any
   vision library.
+
+## Rep velocity and fatigue tracking (feeding irix-mvp-app's AI)
+
+The plan is for irix-mvp-app's AI to run fatigue analysis on a member's
+performance and shape the next set's target weight/reps accordingly (a
+standard velocity-based-training / autoregulation pattern: e.g. stop a
+set, or reduce the next set's load, once rep velocity drops a set
+percentage below the first rep's velocity). That analysis is entirely the
+app's job -- this repo's job is just to supply accurate, per-rep numbers
+for it to work with.
+
+`RepCounter` (`irix/rep_counting/state_machine.py`) buffers every
+angle/timestamp sample seen during a rep's concentric (bottom -> top)
+phase, and on each completed rep reports, alongside the existing
+`duration_s` (time since the previous rep -- tempo/cadence):
+
+- `peak_angular_velocity_deg_s` -- fastest instantaneous |d(angle)/dt|
+  during the rep
+- `mean_angular_velocity_deg_s` -- average speed across the whole
+  concentric phase
+
+Both are **joint-angular velocity, in degrees/second** -- a rep-speed
+proxy computed from whatever joint the exercise config tracks (knee,
+elbow, hip), not a calibrated linear bar velocity in m/s. A calibrated
+velocity needs Section 4.5's barbell centroid tracking against
+per-station camera geometry, which isn't built (see the table above).
+The proxy is good enough for *relative* within-session trend tracking --
+is this rep, or this set, slower than the first one -- which is exactly
+what velocity-loss-based autoregulation needs; it's not meant for
+absolute cross-device comparison against a dedicated VBT sensor.
+
+Both fields flow straight through to `RepCompletedEvent`
+(`irix/pipeline/schema.py`), which is what actually reaches irix-mvp-app.
+Rest time between *sets* doesn't need its own event -- the app can derive
+it from the gap between one `SetCompleteEvent.timestamp` and the next
+`RepCompletedEvent.timestamp` for the same member, both of which are
+already in the stream.
+
+Fixed a real bug while adding this: `RepCounter` used to seed its
+session-start clock from `time.monotonic()` at construction, but every
+caller (tests, the mock demo, a real edge pipeline) has its own timestamp
+convention -- so the very first rep's `duration_s` came out as a huge
+garbage value whenever that convention didn't happen to line up with
+wall-clock monotonic time. It's now seeded from the first timestamp
+`update()` actually sees. `tests/test_rep_counting.py` has a regression
+test for this.
 
 ## Ankle placement for machine leg exercises
 

@@ -96,6 +96,9 @@ def run_mock(
                 station_id=station_id,
                 exercise=exercise_name,
                 rep_count=rep_event.rep_number,
+                duration_s=rep_event.duration_s,
+                peak_velocity_deg_s=rep_event.peak_angular_velocity_deg_s,
+                mean_velocity_deg_s=rep_event.mean_angular_velocity_deg_s,
             )
             buffer.push(camera_event)
             if verbose:
@@ -159,6 +162,9 @@ def run_live(source: str, exercise_name: str, member_id: str, station_id: str):
                             station_id=station_id,
                             exercise=exercise_name,
                             rep_count=rep_event.rep_number,
+                            duration_s=rep_event.duration_s,
+                            peak_velocity_deg_s=rep_event.peak_angular_velocity_deg_s,
+                            mean_velocity_deg_s=rep_event.mean_angular_velocity_deg_s,
                         )
                         buffer.push(camera_event)
                         print(f"[event] {camera_event.to_dict()}")

@@ -33,7 +33,23 @@ def _now() -> float:
 @dataclass
 class RepCompletedEvent:
     """One rep just finished (irix.rep_counting.state_machine.RepEvent,
-    turned into something worth sending off-station)."""
+    turned into something worth sending off-station).
+
+    ``duration_s`` (time since the previous rep) and the two velocity
+    fields exist for fatigue-trend analysis on the irix-mvp-app side --
+    e.g. velocity loss across a set (a standard velocity-based-training /
+    autoregulation signal) to shape the next set's target weight/reps.
+    This repo only supplies the per-rep numbers; the fatigue judgment
+    itself, and what to do about it, is the app's AI's job.
+
+    The velocity fields are joint-angular velocity (deg/s) -- a rep-speed
+    *proxy* derived from the camera-tracked joint angle, not a calibrated
+    linear bar velocity in m/s. A calibrated velocity needs Section 4.5's
+    barbell centroid tracking against per-station camera geometry, which
+    isn't built yet (see docs/ARCHITECTURE.md). Good enough for relative
+    within-session trend tracking (is this rep slower than the first rep
+    of the set?), not for absolute cross-device VBT comparison.
+    """
 
     member_id: str  # wristband-assigned id, not a biometric identifier
     station_id: str
@@ -41,6 +57,9 @@ class RepCompletedEvent:
     rep_count: int
     form_score: Optional[float] = None  # 0-1, None if not yet scored
     weight_kg: Optional[float] = None
+    duration_s: Optional[float] = None  # time since the previous rep (tempo/cadence)
+    peak_velocity_deg_s: Optional[float] = None
+    mean_velocity_deg_s: Optional[float] = None
     timestamp: float = field(default_factory=_now)
 
     def to_dict(self) -> dict:
@@ -52,6 +71,9 @@ class RepCompletedEvent:
             "rep_count": self.rep_count,
             "form_score": self.form_score,
             "weight_kg": self.weight_kg,
+            "duration_s": self.duration_s,
+            "peak_velocity_deg_s": self.peak_velocity_deg_s,
+            "mean_velocity_deg_s": self.mean_velocity_deg_s,
             "timestamp": self.timestamp,
         }
 
