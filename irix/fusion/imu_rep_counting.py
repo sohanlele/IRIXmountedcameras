@@ -44,6 +44,15 @@ from .imu import IMUSample
 class RepResult:
     count: int
     confidence: float
+    # Absolute timestamps (same clock as the input IMUSample.timestamp) of
+    # each accepted peak -- lets a caller line these up event-by-event
+    # against camera-derived rep timestamps (irix.fusion.rep_fusion), not
+    # just compare final counts.
+    peak_timestamps: List[float] = None
+
+    def __post_init__(self):
+        if self.peak_timestamps is None:
+            self.peak_timestamps = []
 
 
 def _imu_buffer_arrays(samples: Sequence[IMUSample]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -143,7 +152,7 @@ class RecoFitCounter:
             return RepResult(0, 0.0)
         filtered_hi = sosfiltfilt(self._sos, sig_hi)
 
-        filtered, _, dt = _resample_uniform(filtered_hi, t_hi, self.target_fs)
+        filtered, t_filtered, dt = _resample_uniform(filtered_hi, t_hi, self.target_fs)
         if filtered.size <= int(self.target_fs * 2):
             return RepResult(0, 0.0)
 
@@ -189,7 +198,8 @@ class RecoFitCounter:
 
         count = int(final.size)
         confidence = min(1.0, count / 20.0 + 0.5) if count else 0.0
-        return RepResult(count, confidence)
+        peak_ts = t_filtered[final].tolist() if count else []
+        return RepResult(count, confidence, peak_timestamps=peak_ts)
 
 
 class ULiftCounter:
@@ -223,9 +233,11 @@ class ULiftCounter:
         if workout_rate <= 0:
             return RepResult(0, 0.0)
 
-        count = self._count_with_best_axis(ax, ay, az, workout_rate)
+        final_indices = self._count_with_best_axis(ax, ay, az, workout_rate)
+        count = int(final_indices.size)
         confidence = min(1.0, count / 20.0 + 0.5) if count else 0.0
-        return RepResult(count, confidence)
+        peak_ts = t_u[final_indices].tolist() if count else []
+        return RepResult(count, confidence, peak_timestamps=peak_ts)
 
     def _estimate_workout_rate(self, ax: np.ndarray, ay: np.ndarray, az: np.ndarray) -> float:
         n = ax.size
@@ -276,7 +288,10 @@ class ULiftCounter:
         best = peaks[np.argmax(search[peaks])]
         return (best + min_lag) / self.target_fs
 
-    def _count_with_best_axis(self, ax: np.ndarray, ay: np.ndarray, az: np.ndarray, workout_rate: float) -> int:
+    def _count_with_best_axis(self, ax: np.ndarray, ay: np.ndarray, az: np.ndarray, workout_rate: float) -> np.ndarray:
+        """Returns the accepted peak *indices* (into the target_fs-uniform
+        grid), not just a count -- callers map these back to timestamps
+        via the uniform time array from the first resample in ``count()``."""
         axes = [ax - ax.mean(), ay - ay.mean(), az - az.mean()]
         ranges = [float(a.max() - a.min()) if a.size else 0.0 for a in axes]
         best_axis = int(np.argmax(ranges))
@@ -284,14 +299,14 @@ class ULiftCounter:
 
         candidates, _ = find_peaks(sig)
         if candidates.size == 0:
-            return 0
+            return np.array([], dtype=int)
 
         cand_amps = sig[candidates]
         amp_thresh = _percentile(cand_amps, 80)
         above = candidates[cand_amps >= amp_thresh]
         if above.size == 0:
-            return 0
+            return np.array([], dtype=int)
 
         wr_half_samples = max(1, round(workout_rate / 2.0 * self.target_fs))
         final = _greedy_select_by_amplitude(above, sig[above], wr_half_samples)
-        return int(final.size)
+        return final

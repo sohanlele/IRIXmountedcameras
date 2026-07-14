@@ -108,13 +108,27 @@ class RepCompletedEvent:
 @dataclass
 class SetCompleteEvent:
     """A set has ended (station-level signal, e.g. rep rate dropped to
-    zero for N seconds, or an operator/BLE trigger closed it out)."""
+    zero for N seconds, or an operator/BLE trigger closed it out).
+
+    ``total_reps`` is the camera's own count, kept as-is for backward
+    compatibility with anything already reading this field. When wristband
+    IMU data was available for the set, irix.fusion.rep_fusion.RepCountFusion
+    reconciles the two into ``fused_rep_count`` -- the count irix-mvp-app
+    should actually treat as authoritative, since it accounts for camera
+    occlusion (falls back toward the IMU when camera tracking_confidence
+    was low) rather than blindly trusting whichever source happened to run
+    first.
+    """
 
     member_id: str
     station_id: str
     exercise: str
     total_reps: int
     timestamp: float = field(default_factory=_now)
+    imu_rep_count: Optional[int] = None
+    fused_rep_count: Optional[int] = None  # None if no IMU data was available -- caller should use total_reps
+    rep_count_agreement: Optional[bool] = None
+    rep_count_source: Optional[str] = None  # see irix.fusion.rep_fusion.FusionSource
 
     def to_dict(self) -> dict:
         return {
@@ -124,6 +138,10 @@ class SetCompleteEvent:
             "exercise": self.exercise,
             "total_reps": self.total_reps,
             "timestamp": self.timestamp,
+            "imu_rep_count": self.imu_rep_count,
+            "fused_rep_count": self.fused_rep_count,
+            "rep_count_agreement": self.rep_count_agreement,
+            "rep_count_source": self.rep_count_source,
         }
 
 
@@ -163,6 +181,14 @@ class WeightConfirmedEvent:
     weight_kg: float
     confidence: float
     timestamp: float = field(default_factory=_now)
+    # Independent geometric sanity check (irix.weight_recognition.
+    # plate_geometry_check) against irix.barbell.detector's plate count in
+    # the same frame(s) -- catches a badly wrong VLM read even though it
+    # can't do fine-grained plate identification on its own (see that
+    # module's docstring for why). None if the check was never run (e.g.
+    # no barbell detector configured for this station).
+    geometry_consistent: Optional[bool] = None
+    geometry_check_reason: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -173,7 +199,92 @@ class WeightConfirmedEvent:
             "weight_kg": self.weight_kg,
             "confidence": self.confidence,
             "timestamp": self.timestamp,
+            "geometry_consistent": self.geometry_consistent,
+            "geometry_check_reason": self.geometry_check_reason,
         }
 
 
-CameraEvent = Union[RepCompletedEvent, SetCompleteEvent, BandPlacementRequiredEvent, WeightConfirmedEvent]
+@dataclass
+class StationHandoffEvent:
+    """A member's authoritative station changed -- irix.topology.handoff's
+    MemberStationTracker decides *when* this actually fires (with
+    hysteresis, to absorb BLE RSSI jitter near a station boundary rather
+    than emitting on every noisy reading). Distinct from
+    BandPlacementRequiredEvent: this is about which station's camera is
+    currently allowed to emit events for this member at all, gating
+    against two adjacent cameras double-counting the same person mid-walk
+    between stations."""
+
+    member_id: str
+    from_station: Optional[str]
+    to_station: str
+    timestamp: float = field(default_factory=_now)
+    # False if to_station isn't a registered neighbor of from_station
+    # (irix.topology.registry.StationRegistry.is_adjacent) -- an
+    # implausible jump across the gym floor in one reading is more likely
+    # a mis-resolved BLE reading than an instant teleport; worth surfacing
+    # to the app/ops dashboard rather than silently trusting it.
+    plausible_adjacency: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": "station_handoff",
+            "member_id": self.member_id,
+            "from_station": self.from_station,
+            "to_station": self.to_station,
+            "timestamp": self.timestamp,
+            "plausible_adjacency": self.plausible_adjacency,
+        }
+
+
+@dataclass
+class SetFatigueSummaryEvent:
+    """A completed set's fatigue analysis (irix.fatigue.SetFatigueAnalyzer),
+    pushed alongside SetCompleteEvent -- the structured context
+    irix-mvp-app's AI uses to shape the member's next set (target weight/
+    reps), per the fatigue-analysis boundary described in
+    irix.fatigue's module docstring: descriptive/classifying (velocity
+    loss %, which VL-zone it landed in, tempo drift, form trend), never
+    prescriptive (no "reduce the weight" instruction originates here)."""
+
+    member_id: str
+    station_id: str
+    exercise: str
+    rep_count: int
+    velocity_tier: str  # "m_s" | "deg_s" | "none"
+    velocity_loss_pct: Optional[float] = None
+    velocity_loss_zone: Optional[str] = None  # "VL10" | "VL20" | "VL30" | "VL45" | None
+    tempo_drift_pct: Optional[float] = None
+    mean_form_score: Optional[float] = None
+    most_common_fault: Optional[str] = None
+    # Cross-set context (irix.fatigue.SessionFatigueTracker), None until a
+    # second set of the same exercise has happened this session.
+    set_to_set_velocity_trend_pct: Optional[float] = None
+    session_fatigue_index: Optional[float] = None
+    completed_sets_this_session: int = 1
+    timestamp: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": "set_fatigue_summary",
+            "member_id": self.member_id,
+            "station_id": self.station_id,
+            "exercise": self.exercise,
+            "rep_count": self.rep_count,
+            "velocity_tier": self.velocity_tier,
+            "velocity_loss_pct": self.velocity_loss_pct,
+            "velocity_loss_zone": self.velocity_loss_zone,
+            "tempo_drift_pct": self.tempo_drift_pct,
+            "mean_form_score": self.mean_form_score,
+            "most_common_fault": self.most_common_fault,
+            "set_to_set_velocity_trend_pct": self.set_to_set_velocity_trend_pct,
+            "session_fatigue_index": self.session_fatigue_index,
+            "completed_sets_this_session": self.completed_sets_this_session,
+            "timestamp": self.timestamp,
+        }
+
+
+CameraEvent = Union[
+    RepCompletedEvent, SetCompleteEvent, BandPlacementRequiredEvent, WeightConfirmedEvent,
+    StationHandoffEvent, SetFatigueSummaryEvent,
+]

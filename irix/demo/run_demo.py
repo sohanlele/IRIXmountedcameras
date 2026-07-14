@@ -72,7 +72,7 @@ def _run_imu_crosscheck(reps_per_second: float, n_seconds: float, verbose: bool)
     anchors" -- here, two independent *counters* on one wristband
     signal). See irix/fusion/imu_rep_counting.py for provenance."""
     from ..fusion.imu_rep_counting import RecoFitCounter, ULiftCounter
-    from tests.test_imu_rep_counting import synthetic_imu_stream
+    from .mock_pose import synthetic_imu_stream
 
     samples = synthetic_imu_stream(n_seconds=n_seconds, reps_per_second=reps_per_second)
     recofit = RecoFitCounter(min_period=1.0 / reps_per_second * 0.5, max_period=1.0 / reps_per_second * 2.0)

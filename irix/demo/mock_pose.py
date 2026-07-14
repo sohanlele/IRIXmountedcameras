@@ -12,6 +12,7 @@ from typing import Iterator, List, Optional
 
 import numpy as np
 
+from ..fusion.imu import IMUSample
 from ..pose.estimator import Keypoint, PersonPose
 from ..rep_counting.exercises import ExerciseConfig
 
@@ -181,3 +182,39 @@ def synthetic_pose_stream(
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
+
+
+def synthetic_imu_stream(
+    n_seconds: float = 16.0,
+    fs: float = 100.0,
+    reps_per_second: float = 0.5,
+    amplitude: float = 6.0,
+    jitter: float = 0.6,
+    seed: int = 0,
+) -> List[IMUSample]:
+    """Vertical accel oscillating like repeated concentric/eccentric reps,
+    riding on gravity, with a bit of higher-frequency jitter (grip/muscle
+    tremor) and sensor noise -- both irix.fusion.imu_rep_counting
+    algorithms' amplitude-percentile filters expect this kind of noise
+    floor, not a clean sinusoid.
+
+    Lives here (not in the test suite) so both tests and
+    irix.demo.run_demo's --with-rep-fusion / --with-imu-crosscheck modes
+    share one synthetic-data implementation.
+    """
+    rng = np.random.default_rng(seed)
+    n = int(n_seconds * fs)
+    t = np.arange(n) / fs
+    az = (
+        -9.81
+        + amplitude * np.sin(2 * np.pi * reps_per_second * t)
+        + jitter * np.sin(2 * np.pi * 4.3 * t)
+        + rng.normal(0, 0.15, n)
+    )
+    ax = rng.normal(0, 0.1, n)
+    ay = rng.normal(0, 0.1, n)
+    gyro_noise = rng.normal(0, 0.05, (n, 3))
+    return [
+        IMUSample(timestamp=float(t[i]), accel=np.array([ax[i], ay[i], az[i]]), gyro=gyro_noise[i])
+        for i in range(n)
+    ]

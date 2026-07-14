@@ -74,9 +74,13 @@ The plan is for irix-mvp-app's AI to run fatigue analysis on a member's
 performance and shape the next set's target weight/reps accordingly (a
 standard velocity-based-training / autoregulation pattern: e.g. stop a
 set, or reduce the next set's load, once rep velocity drops a set
-percentage below the first rep's velocity). That analysis is entirely the
-app's job -- this repo's job is just to supply accurate, per-rep numbers
-for it to work with.
+percentage below the first rep's velocity). The *decision* (what to do
+about it) is entirely the app's job -- this repo's job is to supply
+accurate numbers for it to work with. Originally that meant per-rep
+numbers only; see "Fatigue analysis: set and session level" further down
+for why that boundary later moved to also include set/session-level
+*aggregation and classification* (still not a decision, just less
+redundant arithmetic for the app to redo).
 
 `RepCounter` (`irix/rep_counting/state_machine.py`) buffers every
 angle/timestamp sample seen during a rep's concentric (bottom -> top)
@@ -432,10 +436,218 @@ Out of scope (hardware, not software): camera selection/mounting (Section
 3), edge compute sizing and PoE network design (Section 6.1-6.2), cost
 modeling (Section 10), rollout plan (Section 11).
 
+## Multi-station deployment (Section 6: what changes with 10 cameras instead of 1)
+
+Prompted directly by a concrete deployment target -- "if I deploy 10
+cameras in a gym and every member has a wristband with an IMU I need to
+be able to use both to do accurate rep tracking, weight recognizing,
+fatigue analysis etc, and feed this to the app" -- the sections below
+cover what materially changes once there's more than one camera and more
+than one member on the floor simultaneously, not just a bigger version of
+the single-station demo. The user explicitly said not to feel bound to
+the original design doc's architecture where a better approach exists;
+the three subsections below (fusion, topology, fatigue) each diverge from
+what Section 4.6/5/6 originally sketched, with the reasoning for each
+divergence spelled out inline.
+
+### Camera + wristband IMU: real fusion, not a parallel crosscheck (`irix/fusion/rep_fusion.py`)
+
+Before this pass, "using both" meant `run_demo.py --with-imu-crosscheck`:
+run the camera-based `RepCounter` and the wristband-only
+`RecoFitCounter`/`ULiftCounter` independently, print both numbers side by
+side. That's not fusion -- nothing about the two counts talked to each
+other, and nothing decided which one to actually trust if they disagreed.
+`irix.fusion.rep_fusion.RepCountFusion` is the real version:
+
+- **Reconciliation is decision-level (late fusion), not continuous-state
+  fusion.** The design doc's Section 4.6 sketched folding IMU data into
+  the same EKF used for visual-inertial position tracking
+  (`irix.fusion.ekf`). That's the right tool for a continuous physical
+  quantity (position/orientation) but not for this: "a rep happened" is a
+  discrete event, not a smoothly-varying state, so there's no meaningful
+  single continuous quantity to run a Kalman filter over between "camera
+  thinks rep 4 landed at t=8.1s" and "IMU thinks it landed at t=8.3s".
+  This mirrors how published systems that combine camera/video and
+  wearable IMU for exercise tracking actually do it: e.g. the ACM paper
+  "Wearable IMU-based Gym Exercise Recognition Using Data Fusion Methods"
+  fuses multiple IMU placements at the decision level (each sensor
+  produces its own read, a fusion step reconciles them), and the broader
+  multi-sensor activity-recognition survey literature converges on
+  confidence-weighted decision fusion as the standard pattern for
+  reconciling independent per-modality event/count streams. `irix.fusion.ekf`/
+  `irix.fusion.zupt` remain the right module for the continuous-state
+  problem they solve; this is a different problem needing a different
+  tool.
+- **The unit of analysis is a set, not a rep.** `RecoFitCounter`/
+  `ULiftCounter` are themselves batch algorithms -- they need several
+  cycles of signal to estimate a period via autocorrelation (see
+  `irix/fusion/imu_rep_counting.py`'s own docstring), so running them on
+  a single ~2s rep window isn't meaningful. `RepCountFusion.fuse()` is
+  called once per completed set (`SetCompleteEvent` granularity),
+  matching both algorithms' actual operating range and the granularity
+  `irix-mvp-app` needs an authoritative count at anyway.
+- **The fusion runs bidirectionally.** The camera's own observed rep
+  durations for the set (`RepEvent.duration_s`, already computed) are fed
+  in as `camera_rep_durations` and used to derive `RecoFitCounter`'s
+  period-bounds search (`min_period`/`max_period`) instead of guessing
+  generic 1-4s bounds blind -- the camera improves the IMU algorithm's own
+  accuracy, not just the other way around.
+- **Reconciliation logic**: if camera and IMU counts agree (within
+  `agreement_tolerance`, default ±1), the camera count wins (it also
+  carries velocity/form data the IMU alone doesn't). If they disagree,
+  whichever source has higher confidence wins -- `RepCounter.tracking_confidence`
+  (a new property: fraction of frames with a usable, non-NaN angle this
+  session, i.e. how much of the set wasn't occluded) for the camera, and
+  `RepResult.confidence` for the IMU. This is exactly the case the
+  wristband earns its keep: heavy occlusion drops camera confidence, and
+  fusion correctly leans on the IMU instead (see
+  `tests/test_run_gym_demo.py::test_leg_press_zone_shows_band_placement_and_imu_fallback_on_occlusion`
+  for this exact scenario, and `irix.demo.run_gym_demo`'s `--occlusion`
+  simulation).
+- If no IMU data is available at all for a set (didn't call `fuse()` with
+  samples, or the signal was too short/flat for either algorithm),
+  `source="camera_only"` and the camera count is used as-is -- fusion
+  degrades gracefully to exactly today's single-signal behavior rather
+  than failing.
+
+The reconciled result (`FusedSetRepCount`) flows into
+`SetCompleteEvent.fused_rep_count`/`imu_rep_count`/`rep_count_agreement`/
+`rep_count_source` -- `total_reps` (the camera's own count) is kept
+unchanged for backward compatibility; `fused_rep_count` is what
+`irix-mvp-app` should treat as authoritative when it's present.
+
+### Multi-camera station topology and handoff (`irix/topology/`)
+
+A single-station demo never has to answer "which camera is allowed to
+report events for this person right now" -- there's only one camera.
+Ten cameras on one gym floor do, for two reasons: a member walking from
+the squat rack to the leg press briefly sits in two adjacent cameras'
+fields of view, and `irix.identity.ble_pairing`'s RSSI-based resolution
+is inherently noisy enough (~5-10m typical accuracy indoors, per that
+module's own docstring) that naively trusting every snapshot resolution
+would flicker a member's assignment back and forth near a station
+boundary.
+
+- `irix.topology.registry.StationRegistry` holds the fixed camera/station
+  layout for a gym (`build_default_ten_station_gym()` is a concrete
+  10-camera example covering every currently-configured exercise: two
+  squat racks, two bench stations, one deadlift platform, two dumbbell/
+  curl stations, two leg-press machines, one hack-squat machine), plus an
+  adjacency graph (`is_adjacent`) -- which stations a member could
+  plausibly walk to directly next.
+- `irix.topology.handoff.MemberStationTracker` wraps
+  `StationPairing.resolve()` (which already existed, resolving one
+  snapshot of RSSI readings to a station) with **hysteresis**: a member's
+  assigned station only actually changes after `min_consecutive` readings
+  in a row favor a different station, absorbing RSSI jitter near a
+  boundary rather than emitting a spurious handoff on every noisy
+  reading. Fires a `StationHandoffEvent` (added to the `CameraEvent`
+  family in `irix.pipeline.schema`) only on a real, sustained move --
+  mirroring `BandPlacementTracker`'s existing "only emit on actual
+  change" idiom.
+- `StationHandoffEvent.plausible_adjacency` flags a resolved handoff that
+  isn't between registered-adjacent stations -- a jump across the whole
+  gym floor in one reading is much more likely a mis-resolved BLE reading
+  (multipath reflection, a different member's band transiently closer)
+  than an instant teleport, and is worth surfacing to an ops dashboard
+  rather than silently trusting.
+- `irix.topology.handoff.GymCoordinator` is the gym-wide layer: one
+  instance tracks every member's station via per-member
+  `MemberStationTracker`s, and answers the question a station's edge box
+  needs answered before pushing a camera-derived event for some
+  `member_id`: `is_authoritative(member_id, station_id)`. This is the
+  actual anti-double-counting mechanism -- an adjacent camera that
+  glimpses a member mid-walk should not push rep/weight events for them,
+  because `is_authoritative` for that station returns `False` until a
+  real (hysteresis-confirmed) handoff happens.
+
+See `irix.demo.run_gym_demo._demo_station_handoff_and_dedup` for a
+runnable trace: a member settles at squat-1, a single noisy RSSI reading
+toward squat-2 is correctly absorbed (no handoff, `is_authoritative`
+correctly stays `False` for squat-2), then a sustained 3-reading signal
+correctly triggers a real handoff.
+
+### Fatigue analysis: set and session level (`irix/fatigue/`)
+
+`docs/ARCHITECTURE.md` previously described this repo's fatigue-related
+job as "supply the numbers, the app makes the judgment" -- per-rep
+velocity/duration fields on `RepCompletedEvent`, nothing aggregated.
+That boundary still holds in spirit (nothing in `irix.fatigue` prescribes
+what a member should do next -- no "reduce the weight" instruction
+originates here), but the boundary was drawn further back than it needed
+to be: aggregating and classifying a completed set's fatigue signature
+is still descriptive, not prescriptive, and doing it here means
+`irix-mvp-app` doesn't have to re-derive the same arithmetic from a raw
+rep stream every time it wants context for its AI.
+
+- `irix.fatigue.set_analysis.SetFatigueAnalyzer` aggregates one set's rep
+  samples into a `SetFatigueAnalysis`: **velocity loss %** (first rep vs.
+  last rep, the same well-supported signal `irix.barbell.rpe` already
+  computes per-rep -- see that module's Sanchez-Medina & Gonzalez-Badillo
+  2011 citation -- now aggregated to the set level), which of the
+  standard **VL-zone thresholds** (VL10/VL20/VL30/VL45, the exact
+  thresholds `irix.barbell.rpe`'s docstring already named as standard in
+  that literature) the set's loss crossed, **tempo drift %** (rep
+  duration lengthening across the set -- a fatigue signal independent of
+  velocity, available even with zero calibrated velocity data since
+  `duration_s` is always present), and the set's **form-score trend** and
+  **most common fault** (from `irix.form.scoring`, aggregated).
+- Two-tier velocity, same pattern as everywhere else in this repo:
+  prefers `mean_velocity_m_s` (tier 1, calibrated barbell velocity) when
+  any rep in the set has it, falls back to `mean_velocity_deg_s` (tier 2,
+  joint-angular proxy) otherwise, and reports which tier
+  (`velocity_tier`) actually backed the analysis so a caller never
+  mistakes a proxy-based number for a calibrated one.
+- `irix.fatigue.session_analysis.SessionFatigueTracker` adds the
+  cross-set dimension a single set can't see: **set-to-set velocity
+  trend** (each set's opening-rep velocity vs. the session's first set --
+  catches a member's 3rd set opening 15% slower than their 1st set opened,
+  before that 3rd set has shown any velocity loss of its own) and a
+  **session fatigue index** (0-1, a transparent heuristic blending
+  within-set loss and across-set decline -- explicitly documented in that
+  module as a heuristic, not a validated composite score, since no
+  published formula for combining the two exists the way it does for
+  velocity loss alone).
+- Both feed a new `SetFatigueSummaryEvent` (`irix.pipeline.schema`),
+  pushed alongside `SetCompleteEvent` -- see `irix.demo.run_gym_demo` for
+  two consecutive squat sets showing the session tracker's cross-set
+  fields populate on the second set.
+
+### Weight recognition: a geometric cross-check, not a second reading method (`irix.weight_recognition.plate_geometry_check`)
+
+The existing VLM-based `VisionPlateClassifier` remains the primary weight
+reading method, for the reasons already documented in the "Weight
+recognition: why it ended up VLM-based too" section below -- most
+importantly, standardized competition bumper plates are *all the same
+450mm diameter regardless of weight* (`COMPETITION_BUMPER_PLATE_DIAMETER_MM`),
+distinguishable only by color, which a VLM can reason about and raw plate
+geometry structurally cannot. That fact rules out resurrecting classical
+CV plate classification as an equal, independent second signal.
+
+What plate geometry *can* still do without solving that harder problem:
+sanity-check a VLM read against how many plates are actually visible in
+frame. `check_plate_geometry()` decomposes the VLM-read weight into an
+*expected* plate count per side (a generic commercial-gym plate-weight
+set, greedy decomposition -- an estimate of what should be loaded, not a
+claim about which specific plates are on the bar, since multiple
+combinations can sum to the same total) and compares it against
+`FreeWeightDetector`'s actual detected plate count for that frame. A
+badly wrong VLM read -- hallucinated, or a decimal-point misread -- will
+usually imply a wildly different plate count than what's actually
+visible, even though fine-grained plate-by-plate identification stays out
+of reach. `WeightConfirmedEvent` gained `geometry_consistent`/
+`geometry_check_reason` fields to carry the result; `consistent=True`
+(not `False`) when there's nothing to check against (no plates detected
+-- occluded view, or a non-barbell exercise), since "couldn't check" and
+"check failed" are different things worth keeping distinct.
+
 ## End-to-end demo
 
-`irix/demo/run_demo.py` wires pose -> rep counting -> coaching -> pipeline
-into one loop, in two modes:
+Two demo entrypoints, covering the two things worth demonstrating
+separately: one station in depth, vs. what only shows up with several.
+
+`irix/demo/run_demo.py` wires pose -> rep counting -> structured events ->
+pipeline into one loop for a *single* station, in two modes:
 
 - `--mock-pose`: synthetic joint-angle stream, no camera or model weights
   needed. This is what the test suite and a from-scratch clone can run
@@ -443,3 +655,12 @@ into one loop, in two modes:
 - `--source <index|path>`: real webcam or video file through
   `PoseEstimator` (requires `pip install irix[pose]`, which pulls in
   `ultralytics`/torch).
+
+`irix/demo/run_gym_demo.py` (`python -m irix.demo.run_gym_demo`) is the
+multi-station companion -- see "Multi-station deployment" above for what
+it demonstrates and why it exists as a separate entrypoint rather than
+more flags on `run_demo.py`: station handoff/anti-double-counting,
+camera+IMU rep-count fusion (both the agreement and the occlusion-fallback
+path), set + session fatigue analysis, and the weight-recognition
+geometry cross-check, all in one runnable, deterministic trace across two
+members and three stations.

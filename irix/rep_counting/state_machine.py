@@ -113,17 +113,37 @@ class RepCounter:
         self._reached_bottom = False
         self._concentric_samples: List[Tuple[float, float]] = []
         self._pose_samples: List[PersonPose] = []
+        # Fraction of update() calls with a usable (non-NaN) angle, i.e.
+        # how much of this session's camera tracking wasn't occluded/lost
+        # -- irix.fusion.rep_fusion.RepCountFusion uses this to decide how
+        # much to trust the camera's count vs. the wristband IMU's when
+        # the two disagree (heavy occlusion -> low tracking_confidence ->
+        # lean on the IMU instead).
+        self._total_frames = 0
+        self._valid_frames = 0
 
     def _descending_is_decreasing(self) -> bool:
         """True if moving from top -> bottom means the angle is decreasing."""
         return self.exercise.top_angle > self.exercise.bottom_angle
 
+    @property
+    def tracking_confidence(self) -> float:
+        """Fraction of frames seen so far with a usable (non-NaN) angle.
+        1.0 if every frame tracked cleanly; lower under heavy occlusion.
+        0.0 (not 1.0) before any frames have been seen, so a fusion caller
+        can't mistake "no data yet" for "perfect tracking"."""
+        if self._total_frames == 0:
+            return 0.0
+        return self._valid_frames / self._total_frames
+
     def update(
         self, angle: float, timestamp: Optional[float] = None, pose: Optional[PersonPose] = None
     ) -> Optional[RepEvent]:
         """Feed the latest joint angle in. Returns a RepEvent iff a rep just completed."""
+        self._total_frames += 1
         if angle != angle:  # NaN guard (occlusion / missed keypoint)
             return None
+        self._valid_frames += 1
         ts = timestamp if timestamp is not None else time.monotonic()
         if self._session_start is None:
             self._session_start = ts
