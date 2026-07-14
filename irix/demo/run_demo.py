@@ -1,9 +1,11 @@
 """End-to-end demo entrypoint.
 
 Pipeline: frame source -> PoseEstimator -> joint angle -> RepCounter ->
-CoachingTrigger -> TTSEngine, with each completed rep also pushed into the
-edge pipeline (LocalBuffer -> Aggregator -> CloudSync) as a
-DerivedMetricsEvent.
+structured CameraEvent -> edge pipeline (LocalBuffer -> Aggregator ->
+CloudSync). This repo's job stops at "here's what happened on the gym
+floor" -- turning that into spoken instructions / UI is
+jeffreyjy/irix-mvp-app's job (its `agents/` layer + iOS frontend), not
+this one. The demo just prints the events that would be sent onward.
 
 Two modes:
   --mock-pose   Synthetic joint-angle stream (no camera, no model weights,
@@ -14,13 +16,11 @@ Two modes:
 --with-imu-crosscheck (mock mode only) additionally runs a synthetic
 wristband IMU stream through RecoFitCounter/ULiftCounter (Section 4.6/5.3)
 alongside the camera-based joint-angle counter, and prints both counts.
-This is what "two independent signals" looks like end-to-end: in a real
-deployment the two would feed the EKF (irix.fusion.ekf) rather than just
-being printed side by side.
 
 Example:
     python -m irix.demo.run_demo --mock-pose --exercise squat
     python -m irix.demo.run_demo --mock-pose --exercise squat --with-imu-crosscheck
+    python -m irix.demo.run_demo --mock-pose --exercise leg_press
     python -m irix.demo.run_demo --source 0 --exercise bicep_curl
 """
 from __future__ import annotations
@@ -29,12 +29,11 @@ import argparse
 import sys
 import time
 
-from ..coaching.triggers import CoachingTrigger
-from ..coaching.tts_engine import NullTTSEngine
 from ..pipeline.aggregator import Aggregator
 from ..pipeline.cloud_sync import InMemoryCloudSync
 from ..pipeline.edge_buffer import LocalBuffer
-from ..pipeline.schema import DerivedMetricsEvent
+from ..pipeline.events import BandPlacementTracker
+from ..pipeline.schema import RepCompletedEvent, SetCompleteEvent
 from ..pose.geometry import joint_angle
 from ..rep_counting.exercises import EXERCISES
 from ..rep_counting.state_machine import RepCounter
@@ -73,34 +72,48 @@ def run_mock(
 
     exercise = EXERCISES[exercise_name]
     counter = RepCounter(exercise)
-    coach = CoachingTrigger()
-    tts = NullTTSEngine()
     buffer = LocalBuffer()
     cloud = InMemoryCloudSync()
     aggregator = Aggregator(cloud_sync=cloud)
     aggregator.register_zone("zone-mock", buffer)
 
+    # Band placement is decided station/exercise-side; the event just
+    # tells the app something changed, the app decides how to say it.
+    band_tracker = BandPlacementTracker(member_id=member_id)
+    placement_event = band_tracker.event_for(exercise)
+    if placement_event:
+        buffer.push(placement_event)
+        if verbose:
+            print(f"[event] {placement_event.to_dict()}")
+
     fps = 30.0
     reps_per_second = 0.5
     for t, angle in synthetic_angle_stream(exercise, n_frames=n_frames, fps=fps, reps_per_second=reps_per_second):
-        event = counter.update(angle, timestamp=t)
-        if event:
-            line = coach.on_rep(event)
-            tts.speak(line)
-            buffer.push(
-                DerivedMetricsEvent(
-                    member_id=member_id,
-                    station_id=station_id,
-                    exercise=exercise_name,
-                    rep_count=event.rep_number,
-                )
+        rep_event = counter.update(angle, timestamp=t)
+        if rep_event:
+            camera_event = RepCompletedEvent(
+                member_id=member_id,
+                station_id=station_id,
+                exercise=exercise_name,
+                rep_count=rep_event.rep_number,
             )
+            buffer.push(camera_event)
             if verbose:
-                print(f"[{t:6.2f}s] {line}")
+                print(f"[{t:6.2f}s] [event] {camera_event.to_dict()}")
+
+    if counter.rep_count:
+        buffer.push(
+            SetCompleteEvent(
+                member_id=member_id,
+                station_id=station_id,
+                exercise=exercise_name,
+                total_reps=counter.rep_count,
+            )
+        )
 
     synced = aggregator.sync()
     if verbose:
-        print(f"Total reps (camera): {counter.rep_count}. Synced {synced} events to cloud.")
+        print(f"Total reps (camera): {counter.rep_count}. Synced {synced} events.")
 
     if with_imu_crosscheck:
         _run_imu_crosscheck(reps_per_second=reps_per_second, n_seconds=n_frames / fps, verbose=verbose)
@@ -115,8 +128,6 @@ def run_live(source: str, exercise_name: str, member_id: str, station_id: str):
 
     exercise = EXERCISES[exercise_name]
     counter = RepCounter(exercise)
-    coach = CoachingTrigger()
-    tts = NullTTSEngine()
     buffer = LocalBuffer()
     cloud = InMemoryCloudSync()
     aggregator = Aggregator(cloud_sync=cloud)
@@ -141,19 +152,16 @@ def run_live(source: str, exercise_name: str, member_id: str, station_id: str):
                 a, v, c = person.xy(a_name), person.xy(v_name), person.xy(c_name)
                 if a is not None and v is not None and c is not None:
                     angle = joint_angle(a, v, c)
-                    event = counter.update(angle, timestamp=time.monotonic())
-                    if event:
-                        line = coach.on_rep(event)
-                        tts.speak(line)
-                        buffer.push(
-                            DerivedMetricsEvent(
-                                member_id=member_id,
-                                station_id=station_id,
-                                exercise=exercise_name,
-                                rep_count=event.rep_number,
-                            )
+                    rep_event = counter.update(angle, timestamp=time.monotonic())
+                    if rep_event:
+                        camera_event = RepCompletedEvent(
+                            member_id=member_id,
+                            station_id=station_id,
+                            exercise=exercise_name,
+                            rep_count=rep_event.rep_number,
                         )
-                        print(line)
+                        buffer.push(camera_event)
+                        print(f"[event] {camera_event.to_dict()}")
                     cv2.putText(
                         frame, f"Reps: {counter.rep_count}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,

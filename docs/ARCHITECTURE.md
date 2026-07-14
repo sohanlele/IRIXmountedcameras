@@ -7,6 +7,25 @@ logic for the algorithms the doc specifies, not a production build. It does
 not include camera/network hardware, wristband firmware, Jetson deployment
 configs, or trained model weights.
 
+## Where this repo ends and irix-mvp-app begins
+
+This repo's job is entirely on the camera/edge side: compute what
+happened at a station (a rep completed, a set ended, a weight was
+confirmed, a band needs to move) and hand it off as a structured
+`CameraEvent` (`irix/pipeline/schema.py`). It does not generate spoken
+text, decide what a member should be told, or render any UI -- that's
+[jeffreyjy/irix-mvp-app](https://github.com/jeffreyjy/irix-mvp-app) (a
+FastAPI backend + iOS frontend), specifically its `backend/app/agents`
+layer (AI-generated instructions) and the iOS app (UI). An earlier
+version of this repo had a `coaching/` module that generated spoken
+lines and had a TTS engine interface -- that's been removed in favor of
+`irix/pipeline/events.py`'s `BandPlacementTracker` and the `CameraEvent`
+family, which are the actual data contract between the two repos. As of
+this writing, irix-mvp-app doesn't yet expose a live-camera-data
+ingestion endpoint (its `api/v1` currently covers auth, workout plans,
+and workout sessions) -- `HTTPCloudSync` (`irix/pipeline/cloud_sync.py`)
+is a placeholder pointed at wherever that endpoint ends up.
+
 | Design doc section | Repo module | Status |
 |---|---|---|
 | 4.1 Pose estimation model | `irix/pose/` | YOLO-Pose wrapper (`ultralytics`, optional dep); joint-angle geometry helper |
@@ -17,9 +36,9 @@ configs, or trained model weights.
 | 4.6 Visual-inertial sensor fusion | `irix/fusion/` | EKF (position/velocity state) + ZUPT dead-stop correction; `imu_rep_counting.py` adds two literature IMU-only rep counters (see below) |
 | 5.1 BLE identity linking | `irix/identity/` | RSSI-based station-resolution heuristic (not a BLE radio stack) |
 | 5.4 Personalization data flow | -- | Not implemented; would live alongside `irix/pipeline` as a profile-pull step |
-| 6.3 Data flow (edge -> aggregator -> cloud) | `irix/pipeline/` | `LocalBuffer` -> `Aggregator` -> `CloudSync`, derived-metrics-only schema |
-| 7 / 7.1 Real-time audio coaching | `irix/coaching/` | Coaching-line generation + TTS engine interface (`NullTTSEngine` for tests, `PiperTTSEngine` sketch) |
-| 8 Privacy & data handling | `irix/pipeline/schema.py` | `DerivedMetricsEvent` intentionally carries no video/biometric fields |
+| 6.3 Data flow (edge -> aggregator -> cloud) | `irix/pipeline/` | `LocalBuffer` -> `Aggregator` -> `CloudSync`, structured `CameraEvent` family (`RepCompletedEvent`, `SetCompleteEvent`, `BandPlacementRequiredEvent`, `WeightConfirmedEvent`) |
+| 7 / 7.1 Real-time audio coaching | -- (owned by irix-mvp-app) | Out of scope for this repo -- see "Where this repo ends" above. `BandPlacementTracker` emits the one coaching-adjacent *event*, but not the instruction text itself |
+| 8 Privacy & data handling | `irix/pipeline/schema.py` | Every `CameraEvent` subtype intentionally carries no video/biometric fields (tested) |
 
 ## Wristband IMU-only rep counting (ported from a collaborator's prototype)
 
@@ -62,11 +81,13 @@ free-weight squats: feet stay planted there, so an ankle band sees almost
 no motion -- the barbell is what's moving, tracked by the camera
 (Section 4.5), not the ankle.
 
-`irix/coaching/triggers.py`'s `BandPlacementCoach` is the stateful piece
-that turns this into an actual spoken instruction: it tracks where the
-band currently is across a session and only prompts a reposition when the
+`irix/pipeline/events.py`'s `BandPlacementTracker` is the stateful piece
+that turns this into an actual event: it tracks where the band currently
+is across a session and only emits a `BandPlacementRequiredEvent` when the
 next exercise's `band_placement` differs from the current one, so a
-session that never touches a leg machine stays silent about it.
+session that never touches a leg machine emits nothing about it. Turning
+that event into a spoken instruction is irix-mvp-app's job, not this
+repo's -- see "Where this repo ends" above.
 
 Both ports are unit-tested against synthetic IMU/reading streams in
 `tests/test_imu_rep_counting.py` and `tests/test_confirmation.py`.
