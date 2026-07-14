@@ -17,9 +17,19 @@ Two modes:
 wristband IMU stream through RecoFitCounter/ULiftCounter (Section 4.6/5.3)
 alongside the camera-based joint-angle counter, and prints both counts.
 
+--with-barbell-tracking (mock mode only, exercises with a published
+velocity anchor -- squat/bench_press/deadlift) additionally runs a
+synthetic barbell-pixel stream through irix.barbell's calibration ->
+BarPathTracker -> RPETracker, populating each RepCompletedEvent's
+calibrated m/s velocity, velocity-loss %, and estimated RPE fields
+alongside the always-present joint-angle deg/s proxy. The synthetic
+stream decays in amplitude rep-over-rep so velocity_loss_pct has
+something nonzero to show.
+
 Example:
     python -m irix.demo.run_demo --mock-pose --exercise squat
     python -m irix.demo.run_demo --mock-pose --exercise squat --with-imu-crosscheck
+    python -m irix.demo.run_demo --mock-pose --exercise squat --with-barbell-tracking
     python -m irix.demo.run_demo --mock-pose --exercise leg_press
     python -m irix.demo.run_demo --source 0 --exercise bicep_curl
 """
@@ -29,6 +39,9 @@ import argparse
 import sys
 import time
 
+from ..barbell.calibration import calibrate_from_known_object, COMPETITION_BUMPER_PLATE_DIAMETER_MM
+from ..barbell.rpe import RPETracker
+from ..barbell.tracker import BarPathTracker
 from ..pipeline.aggregator import Aggregator
 from ..pipeline.cloud_sync import InMemoryCloudSync
 from ..pipeline.edge_buffer import LocalBuffer
@@ -67,8 +80,9 @@ def run_mock(
     n_frames: int,
     verbose: bool = True,
     with_imu_crosscheck: bool = False,
+    with_barbell_tracking: bool = False,
 ):
-    from .mock_pose import synthetic_angle_stream
+    from .mock_pose import synthetic_angle_stream, synthetic_bar_pixel_stream
 
     exercise = EXERCISES[exercise_name]
     counter = RepCounter(exercise)
@@ -88,7 +102,31 @@ def run_mock(
 
     fps = 30.0
     reps_per_second = 0.5
+
+    bar_tracker = None
+    rpe_tracker = None
+    bar_stream = None
+    if with_barbell_tracking:
+        # Self-calibrate from a plate of known diameter (Section: cameras-
+        # only install constraint) rather than a painted marker -- see
+        # irix/barbell/calibration.py. The 180px figure is a stand-in for
+        # whatever irix.barbell.detector.FreeWeightDetector would measure
+        # from a real frame.
+        calibration = calibrate_from_known_object(
+            pixel_size=180.0, real_world_size_mm=COMPETITION_BUMPER_PLATE_DIAMETER_MM, station_id=station_id
+        )
+        bar_tracker = BarPathTracker(calibration)
+        rpe_tracker = RPETracker(exercise_name)
+        bar_stream = synthetic_bar_pixel_stream(
+            n_frames=n_frames, fps=fps, reps_per_second=reps_per_second,
+            amplitude_px=90.0, velocity_decay_per_rep=0.08,
+        )
+
     for t, angle in synthetic_angle_stream(exercise, n_frames=n_frames, fps=fps, reps_per_second=reps_per_second):
+        if bar_tracker is not None:
+            _, y_px = next(bar_stream)
+            bar_tracker.push(t, y_px)
+
         rep_event = counter.update(angle, timestamp=t)
         if rep_event:
             camera_event = RepCompletedEvent(
@@ -100,6 +138,14 @@ def run_mock(
                 peak_velocity_deg_s=rep_event.peak_angular_velocity_deg_s,
                 mean_velocity_deg_s=rep_event.mean_angular_velocity_deg_s,
             )
+            if bar_tracker is not None and rep_event.concentric_start_timestamp is not None:
+                bar_velocity = bar_tracker.velocity_for_window(rep_event.concentric_start_timestamp, rep_event.timestamp)
+                camera_event.peak_velocity_m_s = bar_velocity.peak_velocity_m_s
+                camera_event.mean_velocity_m_s = bar_velocity.mean_velocity_m_s
+                if bar_velocity.mean_velocity_m_s is not None:
+                    rpe = rpe_tracker.estimate(bar_velocity.mean_velocity_m_s)
+                    camera_event.velocity_loss_pct = rpe.velocity_loss_pct
+                    camera_event.estimated_rpe = rpe.estimated_rpe
             buffer.push(camera_event)
             if verbose:
                 print(f"[{t:6.2f}s] [event] {camera_event.to_dict()}")
@@ -194,12 +240,18 @@ def main():
         "--with-imu-crosscheck", action="store_true",
         help="(--mock-pose only) also run a synthetic wristband IMU stream through RecoFit/uLift.",
     )
+    parser.add_argument(
+        "--with-barbell-tracking", action="store_true",
+        help="(--mock-pose only) also run a synthetic barbell-pixel stream through irix.barbell for "
+             "calibrated m/s velocity, velocity-loss %%, and estimated RPE.",
+    )
     args = parser.parse_args()
 
     if args.mock_pose:
         run_mock(
             args.exercise, args.member_id, args.station_id, args.frames,
             with_imu_crosscheck=args.with_imu_crosscheck,
+            with_barbell_tracking=args.with_barbell_tracking,
         )
     else:
         run_live(args.source, args.exercise, args.member_id, args.station_id)

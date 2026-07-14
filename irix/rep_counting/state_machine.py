@@ -39,6 +39,13 @@ class RepEvent:
     # (e.g. a very fast rep with a low-fps camera).
     peak_angular_velocity_deg_s: Optional[float] = None
     mean_angular_velocity_deg_s: Optional[float] = None
+    # Timestamp of the first sample in this rep's concentric phase (when
+    # the angle first entered the "bottom" zone). Lets a caller precisely
+    # window an independent signal -- e.g. irix.barbell.tracker.BarPathTracker
+    # -- against the exact same phase this angular-velocity estimate used,
+    # rather than approximating it from duration_s (which spans the whole
+    # previous-rep-to-this-rep gap, not just the concentric phase).
+    concentric_start_timestamp: Optional[float] = None
 
 
 def _phase_velocity(samples: List[Tuple[float, float]]) -> Tuple[Optional[float], Optional[float]]:
@@ -115,6 +122,7 @@ class RepCounter:
         if at_top:
             if self._reached_bottom:
                 self._concentric_samples.append((ts, angle))
+                concentric_start = self._concentric_samples[0][0]
                 peak_v, mean_v = _phase_velocity(self._concentric_samples)
                 self._concentric_samples = []
 
@@ -130,6 +138,7 @@ class RepCounter:
                     duration_s=duration,
                     peak_angular_velocity_deg_s=peak_v,
                     mean_angular_velocity_deg_s=mean_v,
+                    concentric_start_timestamp=concentric_start,
                 )
             self.state = RepState.TOP
             return None

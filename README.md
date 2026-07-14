@@ -49,6 +49,13 @@ IMU-only counters on a synthetic wristband signal):
 python -m irix.demo.run_demo --mock-pose --exercise squat --with-imu-crosscheck
 ```
 
+With barbell tracking (calibrated m/s bar velocity, velocity-loss %, and
+estimated RPE -- squat/bench_press/deadlift have published velocity anchors):
+
+```bash
+python -m irix.demo.run_demo --mock-pose --exercise squat --with-barbell-tracking
+```
+
 ## Test
 
 ```bash
@@ -62,6 +69,7 @@ irix/
   pose/              pose estimation (YOLO-Pose wrapper) + joint-angle geometry
   rep_counting/       joint-angle state machine + per-exercise configs; each rep carries duration + peak/mean velocity for fatigue tracking
   fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters
+  barbell/             self-calibrated (no environment edits) barbell/plate/dumbbell tracking, m/s bar velocity, RPE/velocity-loss estimation
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
   identity/           BLE RSSI station-pairing heuristic
   pipeline/           edge buffer -> aggregator -> cloud sync; structured CameraEvent family (the API contract with irix-mvp-app)

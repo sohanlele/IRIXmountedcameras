@@ -32,7 +32,7 @@ is a placeholder pointed at wherever that endpoint ends up.
 | 4.2 Rep-counting logic | `irix/rep_counting/` | Joint-angle state machine + per-exercise configs (squat/curl/deadlift/leg_press/hack_squat); each completed rep also carries inter-rep duration + peak/mean angular velocity for fatigue tracking (see below) |
 | 4.3 Multi-camera fusion & occlusion | -- | Not implemented; `PoseEstimator` returns single-view poses per camera, multi-view reprojection is future work |
 | 4.4 Weight & plate recognition | `irix/weight_recognition/` | VLM-based classifier (`vision_classifier.py`) is the deployable path -- see below for why QR stickers and OCR were both ruled out; `confirmation.py` adds N-of-M read-confirmation windowing |
-| 4.5 Bar path & velocity tracking | -- | Not implemented (calibrated linear bar velocity); `irix/rep_counting/state_machine.py` supplies a joint-angular-velocity *proxy* per rep in the meantime -- see "Rep velocity and fatigue tracking" below |
+| 4.5 Bar path & velocity tracking | `irix/barbell/` | Self-calibrated (no environment edits) barbell/plate/dumbbell detection, real-unit (m/s) bar-path velocity, and RPE/fatigue estimation -- see "Barbell and dumbbell tracking" below |
 | 4.6 Visual-inertial sensor fusion | `irix/fusion/` | EKF (position/velocity state) + ZUPT dead-stop correction; `imu_rep_counting.py` adds two literature IMU-only rep counters (see below) |
 | 5.1 BLE identity linking | `irix/identity/` | RSSI-based station-resolution heuristic (not a BLE radio stack) |
 | 5.4 Personalization data flow | -- | Not implemented; would live alongside `irix/pipeline` as a profile-pull step |
@@ -113,6 +113,105 @@ garbage value whenever that convention didn't happen to line up with
 wall-clock monotonic time. It's now seeded from the first timestamp
 `update()` actually sees. `tests/test_rep_counting.py` has a regression
 test for this.
+
+## Barbell and dumbbell tracking, and RPE estimation (Section 4.5)
+
+Built directly on precedent from existing open-source barbell trackers,
+adapted to this repo's constraints (cameras-only install, no environment
+edits, third-person fixed-camera geometry rather than first-person).
+
+**Detection.** `irix/barbell/detector.py`'s `FreeWeightDetector` is the
+same wrapper pattern as `PoseEstimator` -- `ultralytics` is a lazily
+imported optional dependency, no bundled weights. Recommended starting
+point for the model itself: fine-tune on the Roboflow "Barbells Detector"
+dataset (92 labeled images + a pretrained model/API,
+[universe.roboflow.com/yolo-project-c2bfs/barbells-detector](https://universe.roboflow.com/yolo-project-c2bfs/barbells-detector))
+or a comparable barbell/plate dataset -- the same category of starting
+point [mattiolato98/deadlift-visual-analyzer](https://github.com/mattiolato98/deadlift-visual-analyzer)
+used for its YOLOv5 barbell class (with mean-shift tracking layered on
+top for frame-to-frame continuity when detection confidence dips).
+Dumbbell tracking isn't a separate problem -- it's the same detector with
+a `dumbbell` class label and the same downstream tracker.
+
+**Calibration, without touching any equipment.**
+`irix/barbell/calibration.py` converts pixel measurements to real-world
+distances by self-calibrating off a detected object's *already-known
+standard dimension* -- a competition bumper plate's 450mm diameter, or a
+men's Olympic barbell's 2200mm length -- rather than a physical marker.
+[kostecky/VBT-Barbell-Tracker](https://github.com/kostecky/VBT-Barbell-Tracker)
+(78 stars) uses the identical self-calibration *principle* -- pixel size
+of a known-diameter reference object gives a px-per-mm scale -- but
+against a painted marker on the barbell, which isn't usable here since
+painting/marking equipment is an environment edit (the same constraint
+that ruled out QR plate stickers in `irix/weight_recognition`). Using the
+equipment's own manufactured geometry as the reference gets the same
+self-calibration property with literally nothing added to the gym floor.
+The module also sketches (but doesn't require) a one-time checkerboard
+camera-intrinsics calibration, the same `cv2.calibrateCamera`/
+`cv2.fisheye` approach VBT-Barbell-Tracker uses in its
+`undistort_fisheye.py` -- a legitimate one-time install step (photograph
+a checkerboard from the already-mounted camera) rather than an equipment
+edit, and worth doing for wide-angle lenses. Known simplification, stated
+plainly in the module docstring: the px-per-mm scale is treated as
+isotropic across a station's field of view -- no full 3D camera pose
+solve. That's the same rigor level the hobbyist projects above use; a
+per-station homography (four known reference points at install time)
+would remove the limitation and is a reasonable upgrade path, not
+attempted here.
+
+**Tracking.** `irix/barbell/tracker.py`'s `BarPathTracker` buffers
+calibrated real-world vertical position over time and computes
+displacement/peak/mean velocity for any timestamp window -- in **m/s**,
+a genuine calibrated measurement, unlike `irix/rep_counting`'s
+joint-angular-velocity proxy (deg/s). `RepEvent` (rep_counting/state_machine.py)
+now exposes `concentric_start_timestamp` specifically so a caller can
+window a `BarPathTracker` query against the *exact* same concentric
+phase the joint-angle counter used, rather than approximating it from
+`duration_s` (which spans the whole previous-rep-to-this-rep gap). This
+is a genuine two-tier design: `RepCompletedEvent` carries both the
+always-available `*_deg_s` proxy and the `*_m_s` calibrated fields (None
+whenever no free weight is currently being tracked, e.g. a machine
+station or before the detector locks on) -- callers should prefer the
+`_m_s` fields when present and fall back to `_deg_s` otherwise.
+
+**RPE / fatigue estimation.** `irix/barbell/rpe.py`'s `RPETracker`
+produces two signals per rep, feeding the same fatigue-analysis boundary
+described above (this repo supplies numbers, irix-mvp-app's AI makes the
+training decision):
+
+- `velocity_loss_pct` -- percent velocity loss relative to that set's
+  first rep. The primary, well-grounded signal: Sanchez-Medina &
+  Gonzalez-Badillo (2011), "Velocity Loss as an Indicator of
+  Neuromuscular Fatigue During Resistance Training" (*Med Sci Sports
+  Exerc*), found within-set velocity loss correlates strongly with
+  independent fatigue markers in the full squat (blood lactate r=0.97,
+  ammonia R²=0.85, countermovement-jump-height loss r=0.92). Doesn't
+  require knowing anyone's true 1RM -- self-normalizes against that
+  lifter's own first rep of that set.
+- `estimated_rpe` -- an absolute RPE estimate from published
+  population-average velocity-at-1RM anchors (squat 0.23 m/s, bench
+  press 0.10 m/s, deadlift 0.14 m/s), from Zourdos et al. (2016),
+  "Novel Resistance Training-Specific RPE Scale Measuring Repetitions in
+  Reserve" (*J Strength Cond Res* 30(1):267-275) and a follow-on
+  replication (Helms et al.) building on the same methodology. Zourdos
+  et al. found a strong inverse RPE-velocity relationship (r≈-0.88 for
+  the back squat). Stated plainly: this is meaningfully less precise
+  than velocity loss -- it's a population average, not this lifter's
+  measured load-velocity profile, and a 20-study/434-lifter meta-analysis
+  found even *individually calibrated* load-velocity 1RM estimates carry
+  a standard error of ~9.8% of 1RM. `estimate_rpe` returns `None` for any
+  exercise without a published anchor (e.g. `leg_press`, `bicep_curl` --
+  the source literature studied competition powerlifts specifically).
+  Mapping a specific velocity-loss percentage to an RPE/RIR delta is a
+  genuinely open question in this literature (no source found converges
+  on one universal table) -- left to irix-mvp-app's fatigue layer to
+  decide rather than guessed at here.
+
+`irix/demo/run_demo.py --with-barbell-tracking` (mock mode, squat/bench_press/deadlift)
+wires all of this end-to-end against a synthetic barbell-pixel stream
+with rep-over-rep amplitude decay, so `velocity_loss_pct` and
+`estimated_rpe` both show a visible fatigue trend across a set without
+needing a camera.
 
 ## Ankle placement for machine leg exercises
 

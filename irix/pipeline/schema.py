@@ -58,8 +58,23 @@ class RepCompletedEvent:
     form_score: Optional[float] = None  # 0-1, None if not yet scored
     weight_kg: Optional[float] = None
     duration_s: Optional[float] = None  # time since the previous rep (tempo/cadence)
+
+    # Tier 2 (fallback): joint-angular velocity proxy, always available
+    # from the camera-tracked joint angle alone (irix.rep_counting).
     peak_velocity_deg_s: Optional[float] = None
     mean_velocity_deg_s: Optional[float] = None
+
+    # Tier 1 (preferred, when a barbell/dumbbell is being tracked):
+    # calibrated linear velocity in m/s from irix.barbell.tracker, plus
+    # the fatigue signals derived from it (irix.barbell.rpe). None
+    # whenever no free weight is being tracked for this rep (e.g. a
+    # machine station, or before the detector has locked on) -- callers
+    # should fall back to the deg/s fields above in that case.
+    peak_velocity_m_s: Optional[float] = None
+    mean_velocity_m_s: Optional[float] = None
+    velocity_loss_pct: Optional[float] = None
+    estimated_rpe: Optional[float] = None
+
     timestamp: float = field(default_factory=_now)
 
     def to_dict(self) -> dict:
@@ -74,6 +89,10 @@ class RepCompletedEvent:
             "duration_s": self.duration_s,
             "peak_velocity_deg_s": self.peak_velocity_deg_s,
             "mean_velocity_deg_s": self.mean_velocity_deg_s,
+            "peak_velocity_m_s": self.peak_velocity_m_s,
+            "mean_velocity_m_s": self.mean_velocity_m_s,
+            "velocity_loss_pct": self.velocity_loss_pct,
+            "estimated_rpe": self.estimated_rpe,
             "timestamp": self.timestamp,
         }
 

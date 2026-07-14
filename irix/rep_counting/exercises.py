@@ -81,6 +81,14 @@ DEADLIFT = ExerciseConfig(
     band_placement=BandPlacement.WRIST,
 )
 
+BENCH_PRESS = ExerciseConfig(
+    name="bench_press",
+    joint_triplet=("left_shoulder", "left_elbow", "left_wrist"),
+    bottom_angle=75.0,   # bar at chest
+    top_angle=165.0,     # lockout
+    band_placement=BandPlacement.WRIST,
+)
+
 # Machines zone (Section 3.2): the foot is the rigid contact point with
 # the load on these, so the IMU band moves to the ankle.
 LEG_PRESS = ExerciseConfig(
@@ -99,4 +107,4 @@ HACK_SQUAT = ExerciseConfig(
     band_placement=BandPlacement.ANKLE,
 )
 
-EXERCISES = {c.name: c for c in (SQUAT, BICEP_CURL, DEADLIFT, LEG_PRESS, HACK_SQUAT)}
+EXERCISES = {c.name: c for c in (SQUAT, BICEP_CURL, DEADLIFT, BENCH_PRESS, LEG_PRESS, HACK_SQUAT)}
