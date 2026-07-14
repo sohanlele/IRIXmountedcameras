@@ -22,6 +22,12 @@ once. This does:
 - ``irix.weight_recognition.plate_geometry_check``: a synthetic VLM
   weight read is sanity-checked against a synthetic barbell-detector
   plate count from the same frame.
+- ``irix.identity.motion_correlation`` (via
+  ``GymCoordinator.disambiguate_by_motion``): two members whose BLE
+  readings both resolve to the *same* crowded station (RSSI alone can't
+  tell them apart) get correctly told apart by cross-correlating each
+  camera-detected skeleton's wrist motion against each candidate's
+  wristband IMU signal.
 
 Deterministic (seeded) synthetic data throughout -- no camera, no model
 weights, same "runs anywhere, no hardware needed" property as
@@ -33,12 +39,18 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+from ..barbell.calibration import calibrate_from_known_object, COMPETITION_BUMPER_PLATE_DIAMETER_MM
 from ..barbell.detector import FreeWeightClass, FreeWeightDetection
+from ..barbell.rpe import EXERCISE_1RM_VELOCITY_MS, RPETracker
+from ..barbell.tracker import BarPathTracker
 from ..fatigue.models import RepFatigueSample
 from ..fatigue.session_analysis import SessionFatigueTracker
 from ..fatigue.set_analysis import SetFatigueAnalyzer
 from ..form.scoring import FormScorer
 from ..fusion.rep_fusion import RepCountFusion
+import numpy as np
+
+from ..fusion.imu import IMUSample
 from ..identity.ble_pairing import BLEReading
 from ..pipeline.aggregator import Aggregator
 from ..pipeline.cloud_sync import InMemoryCloudSync
@@ -50,12 +62,19 @@ from ..pipeline.schema import (
     SetFatigueSummaryEvent,
     WeightConfirmedEvent,
 )
+from ..pose.estimator import COCO_KEYPOINT_NAMES, Keypoint, PersonPose
 from ..rep_counting.exercises import EXERCISES
 from ..rep_counting.state_machine import RepCounter
 from ..topology.handoff import GymCoordinator
 from ..topology.registry import build_default_ten_station_gym
 from ..weight_recognition.plate_geometry_check import check_plate_geometry
-from .mock_pose import synthetic_angle_stream, synthetic_imu_stream, synthetic_pose_stream
+from .mock_pose import (
+    synthetic_angle_stream,
+    synthetic_bar_pixel_stream,
+    synthetic_imu_stream,
+    synthetic_pose_stream,
+    synthetic_wrist_motion_pose_stream,
+)
 
 
 def _run_one_set(
@@ -70,6 +89,8 @@ def _run_one_set(
     occlusion: bool = False,
     inject_form_fault: Optional[str] = None,
     session_tracker: Optional[SessionFatigueTracker] = None,
+    with_barbell_tracking: bool = False,
+    velocity_decay_per_rep: float = 0.0,
     verbose: bool = True,
 ) -> SetCompleteEvent:
     """Runs one full set at one station: camera rep counting (+ optional
@@ -83,6 +104,19 @@ def _run_one_set(
     ``occlusion=True`` simulates most camera frames losing tracking
     (angle -> NaN) partway through the set, to demonstrate
     RepCountFusion falling back toward the IMU count.
+
+    ``with_barbell_tracking=True`` (only meaningful for exercises with a
+    published velocity anchor -- see irix.barbell.rpe.EXERCISE_1RM_VELOCITY_MS)
+    additionally self-calibrates against a known plate diameter and runs a
+    synthetic barbell-pixel stream through BarPathTracker/RPETracker, the
+    same as run_demo.py's --with-barbell-tracking, so each rep gets a
+    calibrated mean_velocity_m_s instead of only the joint-angular deg/s
+    proxy. That's what lets irix.fatigue.SetFatigueAnalyzer pick the "m_s"
+    tier instead of falling back to "deg_s" -- see
+    docs/ARCHITECTURE.md's "Barbell tracking in the multi-station demo"
+    section for why this matters: velocity_loss_pct computed from a
+    joint-angle proxy is directionally right but not the calibrated signal
+    the VL10/20/30/45 zone thresholds were validated against.
     """
     exercise = EXERCISES[exercise_name]
     counter = RepCounter(exercise)
@@ -96,12 +130,29 @@ def _run_one_set(
             inject_fault=inject_form_fault,
         )
 
+    bar_tracker = None
+    rpe_tracker = None
+    bar_stream = None
+    if with_barbell_tracking and exercise_name in EXERCISE_1RM_VELOCITY_MS:
+        calibration = calibrate_from_known_object(
+            pixel_size=180.0, real_world_size_mm=COMPETITION_BUMPER_PLATE_DIAMETER_MM, station_id=station_id,
+        )
+        bar_tracker = BarPathTracker(calibration)
+        rpe_tracker = RPETracker(exercise_name)
+        bar_stream = synthetic_bar_pixel_stream(
+            n_frames=n_frames, fps=fps, reps_per_second=reps_per_second,
+            amplitude_px=90.0, velocity_decay_per_rep=velocity_decay_per_rep,
+        )
+
     for i, (t, angle) in enumerate(
         synthetic_angle_stream(exercise, n_frames=n_frames, fps=fps, reps_per_second=reps_per_second)
     ):
         pose = None
         if pose_stream is not None:
             _, _, pose = next(pose_stream)
+        if bar_tracker is not None:
+            _, y_px = next(bar_stream)
+            bar_tracker.push(t, y_px)
         frame_angle = angle
         if occlusion and n_frames // 3 <= i < 2 * n_frames // 3:
             # Simulate the camera losing the lifter for the middle third
@@ -122,6 +173,16 @@ def _run_one_set(
                 if assessment is not None:
                     camera_event.form_score = assessment.score
                     camera_event.form_faults = assessment.faults
+            if bar_tracker is not None and rep_event.concentric_start_timestamp is not None:
+                bar_velocity = bar_tracker.velocity_for_window(
+                    rep_event.concentric_start_timestamp, rep_event.timestamp,
+                )
+                camera_event.peak_velocity_m_s = bar_velocity.peak_velocity_m_s
+                camera_event.mean_velocity_m_s = bar_velocity.mean_velocity_m_s
+                if bar_velocity.mean_velocity_m_s is not None:
+                    rpe = rpe_tracker.estimate(bar_velocity.mean_velocity_m_s)
+                    camera_event.velocity_loss_pct = rpe.velocity_loss_pct
+                    camera_event.estimated_rpe = rpe.estimated_rpe
             buffer.push(camera_event)
             fatigue_samples.append(RepFatigueSample.from_rep_completed_event(camera_event))
             if verbose:
@@ -254,9 +315,54 @@ def _demo_station_handoff_and_dedup(verbose: bool = True) -> GymCoordinator:
     return coordinator
 
 
+def _demo_motion_correlation_disambiguation(verbose: bool = True) -> None:
+    """Two members, 'carol' and 'dave', both doing curls at a shared/
+    crowded curl-1 station -- their BLE readings both resolve to curl-1
+    (RSSI proximity alone can only rank *stations* for one member, it
+    can't tell two co-located members' bands apart from each other, see
+    irix.identity.motion_correlation's module docstring). The station's
+    camera sees two people; GymCoordinator.disambiguate_by_motion
+    correctly figures out which detected skeleton is which member by
+    correlating each one's wrist motion against each candidate's
+    wristband IMU signal -- carol lifting at a faster tempo than dave.
+    """
+    registry = build_default_ten_station_gym()
+    coordinator = GymCoordinator(registry, min_consecutive=1)
+    coordinator.update_member("member-carol", [BLEReading("curl-1", -50.0, 0.0)], timestamp=0.0)
+    coordinator.update_member("member-dave", [BLEReading("curl-1", -51.0, 0.0)], timestamp=0.0)
+    candidates = coordinator.active_members_at("curl-1")
+    if verbose:
+        print(f"  [topology] BLE alone resolves both {candidates} to curl-1 -- ambiguous, camera has to disambiguate")
+
+    # carol's real tempo is faster (0.6 reps/s) than dave's (0.3 reps/s);
+    # each member's own wristband IMU stream matches their own tempo,
+    # same as it would in reality -- the wristband can only measure its
+    # wearer's actual motion.
+    poses_person_0 = synthetic_wrist_motion_pose_stream(reps_per_second=0.6, phase=0.0, seed=10)
+    poses_person_1 = synthetic_wrist_motion_pose_stream(reps_per_second=0.3, phase=0.9, seed=11)
+    imu_carol = synthetic_imu_stream(n_seconds=6.0, reps_per_second=0.6, phase=0.0, seed=12)
+    imu_dave = synthetic_imu_stream(n_seconds=6.0, reps_per_second=0.3, phase=0.9, seed=13)
+
+    results = coordinator.disambiguate_by_motion(
+        station_id="curl-1",
+        candidate_imu_streams={"member-carol": imu_carol, "member-dave": imu_dave},
+        detected_people_poses=[poses_person_0, poses_person_1],
+        pose_fps=30.0,
+    )
+    if verbose:
+        for person_idx, match in enumerate(results):
+            print(f"  [motion correlation] detected person {person_idx} -> {match}")
+        assert results[0] is not None and results[0].member_id == "member-carol"
+        assert results[1] is not None and results[1].member_id == "member-dave"
+        print("  [motion correlation] correctly resolved both detected skeletons to the right member")
+
+
 def main() -> Dict[str, InMemoryCloudSync]:
     print("=== Station topology + BLE handoff / anti-double-count demo ===")
     _demo_station_handoff_and_dedup()
+
+    print("\n=== Two members BLE-ambiguous at one station -- camera+IMU motion correlation disambiguates ===")
+    _demo_motion_correlation_disambiguation()
 
     print("\n=== Member 'alice': 2 squat sets at squat-1 (session fatigue building) ===")
     cloud_squat = InMemoryCloudSync()
@@ -266,12 +372,14 @@ def main() -> Dict[str, InMemoryCloudSync]:
     alice_session = SessionFatigueTracker()
     _run_one_set(
         "squat", "member-alice", "squat-1", buffer_squat, seed=1,
-        session_tracker=alice_session, verbose=True,
+        session_tracker=alice_session, with_barbell_tracking=True, velocity_decay_per_rep=0.05,
+        verbose=True,
     )
     print("  -- rest --")
     _run_one_set(
         "squat", "member-alice", "squat-1", buffer_squat, seed=2, reps_per_second=0.55,
-        session_tracker=alice_session, verbose=True,
+        session_tracker=alice_session, with_barbell_tracking=True, velocity_decay_per_rep=0.08,
+        verbose=True,
     )
 
     print("\n=== Member 'alice': weight-recognition geometry cross-check ===")

@@ -1,8 +1,10 @@
 """Tests for irix.topology -- station registry + BLE-based handoff with hysteresis."""
-from irix.identity.ble_pairing import BLEReading
+import numpy as np
+
+from irix.fusion.imu import IMUSample
+from irix.identity.ble_pairing import BLEReading, StationPairing
 from irix.topology.handoff import GymCoordinator, MemberStationTracker
 from irix.topology.registry import StationInfo, StationRegistry, build_default_ten_station_gym
-from irix.identity.ble_pairing import StationPairing
 
 
 def test_default_ten_station_gym_has_ten_stations():
@@ -117,3 +119,54 @@ def test_gym_coordinator_tracks_multiple_members_independently():
     coord.update_member("m2", [BLEReading("curl-1", -50.0, 0.0)], timestamp=0.0)
     assert coord.current_station("m1") == "squat-1"
     assert coord.current_station("m2") == "curl-1"
+
+
+def _wrist_imu(freq, phase, n_seconds=6.0, fs=100.0, seed=0):
+    rng = np.random.default_rng(seed)
+    n = int(n_seconds * fs)
+    samples = []
+    for i in range(n):
+        t = i / fs
+        az = -9.81 - 6.0 * np.sin(2 * np.pi * freq * t + phase) + rng.normal(0, 0.05)
+        samples.append(IMUSample(timestamp=t, accel=np.array([0, 0, az]), gyro=np.array([0, 0, 0])))
+    return samples
+
+
+def _wrist_poses(freq, phase, n=180, fps=30.0, seed=0):
+    from irix.pose.estimator import COCO_KEYPOINT_NAMES, Keypoint, PersonPose
+
+    rng = np.random.default_rng(seed)
+    poses = []
+    for i in range(n):
+        t = i / fps
+        y = 500.0 + 50.0 * np.sin(2 * np.pi * freq * t + phase) + rng.normal(0, 0.3)
+        kps = []
+        for name in COCO_KEYPOINT_NAMES:
+            if name == "left_wrist":
+                kps.append(Keypoint(x=100.0, y=y, confidence=0.9))
+            else:
+                kps.append(Keypoint(x=0.0, y=0.0, confidence=0.0))
+        poses.append(PersonPose(keypoints=kps))
+    return poses
+
+
+def test_gym_coordinator_disambiguate_by_motion_resolves_ambiguous_members():
+    registry = build_default_ten_station_gym()
+    coord = GymCoordinator(registry, min_consecutive=1)
+    coord.update_member("carol", [BLEReading("curl-1", -50.0, 0.0)], timestamp=0.0)
+    coord.update_member("dave", [BLEReading("curl-1", -51.0, 0.0)], timestamp=0.0)
+    assert set(coord.active_members_at("curl-1")) == {"carol", "dave"}
+
+    poses_a = _wrist_poses(freq=0.6, phase=0.0, seed=1)
+    poses_b = _wrist_poses(freq=0.3, phase=0.9, seed=2)
+    imu_carol = _wrist_imu(freq=0.6, phase=0.0, seed=3)
+    imu_dave = _wrist_imu(freq=0.3, phase=0.9, seed=4)
+
+    results = coord.disambiguate_by_motion(
+        station_id="curl-1",
+        candidate_imu_streams={"carol": imu_carol, "dave": imu_dave},
+        detected_people_poses=[poses_a, poses_b],
+        pose_fps=30.0,
+    )
+    assert results[0] is not None and results[0].member_id == "carol"
+    assert results[1] is not None and results[1].member_id == "dave"

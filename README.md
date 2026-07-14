@@ -49,12 +49,16 @@ python -m irix.demo.run_gym_demo
 
 Two members, three stations, one runnable trace showing: BLE-based station
 handoff with hysteresis (and a spurious adjacent-camera detection
-correctly *not* double-counted), camera+wristband-IMU rep-count fusion
-(both the normal-agreement path and a heavily-occluded set where fusion
-correctly falls back to the IMU), set + session fatigue analysis across
-two consecutive squat sets, a bicep-curl set with an injected form fault
-actually getting caught, and a weight-recognition geometry cross-check
-(one plausible VLM read, one flagged as implausible). See
+correctly *not* double-counted), two BLE-ambiguous members at one shared
+station correctly told apart by correlating each one's camera-tracked
+wrist motion against their own wristband's IMU signal, camera+wristband-
+IMU rep-count fusion (both the normal-agreement path and a heavily-
+occluded set where fusion correctly falls back to the IMU), calibrated
+barbell-velocity tracking feeding set + session fatigue analysis across
+two consecutive squat sets (real VL-zone progression, not just the
+joint-angle proxy), a bicep-curl set with an injected form fault actually
+getting caught, and a weight-recognition geometry cross-check (one
+plausible VLM read, one flagged as implausible). See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)'s "Multi-station
 deployment" section for what each piece is doing and why.
 
@@ -118,9 +122,9 @@ irix/
   fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters; rep_fusion.py reconciles camera + IMU set-level rep counts into one authoritative count
   fatigue/             set + session-level fatigue analysis (velocity loss %, VL-zone classification, tempo drift, form trend) aggregated for irix-mvp-app's AI context
   topology/            multi-camera station registry (10-camera example layout) + BLE-hysteresis member handoff, gating which station's events are authoritative to prevent double-counting
+  identity/            BLE RSSI station-pairing heuristic + motion-correlation disambiguation (camera wrist motion vs. wristband IMU) for when two members' bands are both in range of one station
   barbell/             self-calibrated (no environment edits) barbell/plate/dumbbell tracking, m/s bar velocity, RPE/velocity-loss estimation
   weight_recognition/ VLM-based plate/load classifier (pluggable local/cloud backend), N-of-M read confirmation, geometric plate-count cross-check, QR reader (reference only, not deployable -- see docs/ARCHITECTURE.md)
-  identity/           BLE RSSI station-pairing heuristic
   pipeline/           edge buffer -> aggregator -> cloud sync; structured CameraEvent family (the API contract with irix-mvp-app)
   demo/               single-station (run_demo.py) and multi-station (run_gym_demo.py) end-to-end CLIs
 tests/                 unit + smoke tests for every module above

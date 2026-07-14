@@ -25,8 +25,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from ..fusion.imu import IMUSample
 from ..identity.ble_pairing import BLEReading, StationPairing
+from ..identity.motion_correlation import MotionCorrelationMatch, MotionCorrelationResolver
 from ..pipeline.schema import StationHandoffEvent
+from ..pose.estimator import PersonPose
 from .registry import StationRegistry
 
 
@@ -133,3 +136,29 @@ class GymCoordinator:
 
     def active_members_at(self, station_id: str) -> List[str]:
         return [m for m, t in self._trackers.items() if t.current_station == station_id]
+
+    def disambiguate_by_motion(
+        self,
+        station_id: str,
+        candidate_imu_streams: Dict[str, List[IMUSample]],
+        detected_people_poses: List[List[PersonPose]],
+        pose_fps: float,
+        resolver: Optional[MotionCorrelationResolver] = None,
+    ) -> List[Optional[MotionCorrelationMatch]]:
+        """Call when ``active_members_at(station_id)`` reports more than
+        one BLE-resolved member for a station where the camera also sees
+        more than one person -- RSSI proximity (``irix.identity.ble_pairing``)
+        can rank *stations* for one member's band, but can't by itself
+        tell two co-located members' bands apart from each other. Delegates
+        to ``irix.identity.motion_correlation.MotionCorrelationResolver``
+        -- see that module's docstring for the actual algorithm and its
+        honestly-documented limitations; this is just the integration
+        point so a caller that already has a ``GymCoordinator`` doesn't
+        need to import and wire up that module separately.
+
+        ``candidate_imu_streams`` should normally be exactly the members
+        ``active_members_at(station_id)`` returns (this doesn't enforce
+        that -- a caller might reasonably want to try a slightly wider or
+        narrower candidate set)."""
+        resolver = resolver or MotionCorrelationResolver()
+        return resolver.resolve(candidate_imu_streams, detected_people_poses, pose_fps)

@@ -190,6 +190,7 @@ def synthetic_imu_stream(
     reps_per_second: float = 0.5,
     amplitude: float = 6.0,
     jitter: float = 0.6,
+    phase: float = 0.0,
     seed: int = 0,
 ) -> List[IMUSample]:
     """Vertical accel oscillating like repeated concentric/eccentric reps,
@@ -198,16 +199,22 @@ def synthetic_imu_stream(
     algorithms' amplitude-percentile filters expect this kind of noise
     floor, not a clean sinusoid.
 
-    Lives here (not in the test suite) so both tests and
-    irix.demo.run_demo's --with-rep-fusion / --with-imu-crosscheck modes
-    share one synthetic-data implementation.
+    ``phase`` (radians) shifts the primary rep-rate sinusoid -- unused by
+    the rep-counting tests/demos (always 0.0 there), but lets
+    irix.demo.run_gym_demo's motion-correlation scenario generate two
+    wristbands with distinguishable timing without needing a second
+    generator function.
+
+    Lives here (not in the test suite) so tests, irix.demo.run_demo's
+    --with-rep-fusion / --with-imu-crosscheck modes, and
+    irix.demo.run_gym_demo all share one synthetic-data implementation.
     """
     rng = np.random.default_rng(seed)
     n = int(n_seconds * fs)
     t = np.arange(n) / fs
     az = (
         -9.81
-        + amplitude * np.sin(2 * np.pi * reps_per_second * t)
+        + amplitude * np.sin(2 * np.pi * reps_per_second * t + phase)
         + jitter * np.sin(2 * np.pi * 4.3 * t)
         + rng.normal(0, 0.15, n)
     )
@@ -218,3 +225,39 @@ def synthetic_imu_stream(
         IMUSample(timestamp=float(t[i]), accel=np.array([ax[i], ay[i], az[i]]), gyro=gyro_noise[i])
         for i in range(n)
     ]
+
+
+def synthetic_wrist_motion_pose_stream(
+    n_frames: int = 180,
+    fps: float = 30.0,
+    reps_per_second: float = 0.5,
+    phase: float = 0.0,
+    amplitude_px: float = 50.0,
+    y0_px: float = 500.0,
+    noise_px: float = 0.3,
+    seed: int = 0,
+) -> List[PersonPose]:
+    """A PersonPose sequence with only ``left_wrist`` confidently tracked,
+    oscillating vertically at ``reps_per_second``/``phase`` -- built for
+    irix.identity.motion_correlation's disambiguation scenario (which
+    only needs one keypoint's motion timing, not a full exercise-specific
+    body pose like synthetic_pose_stream builds). ``phase`` lets a demo
+    generate two people with genuinely distinguishable motion timing, the
+    same way ``synthetic_imu_stream``'s new ``phase`` parameter does for
+    the matching wristband signal.
+    """
+    from ..pose.estimator import COCO_KEYPOINT_NAMES, Keypoint, PersonPose
+
+    rng = np.random.default_rng(seed)
+    poses = []
+    for i in range(n_frames):
+        t = i / fps
+        y = y0_px + amplitude_px * math.sin(2 * math.pi * reps_per_second * t + phase) + rng.normal(0, noise_px)
+        keypoints = []
+        for name in COCO_KEYPOINT_NAMES:
+            if name == "left_wrist":
+                keypoints.append(Keypoint(x=100.0, y=float(y), confidence=0.9))
+            else:
+                keypoints.append(Keypoint(x=0.0, y=0.0, confidence=0.0))
+        poses.append(PersonPose(keypoints=keypoints))
+    return poses

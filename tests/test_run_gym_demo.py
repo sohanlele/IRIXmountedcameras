@@ -2,7 +2,7 @@
 end-to-end scenario tying together topology handoff, rep fusion, fatigue
 analysis, form scoring, and the weight-recognition geometry cross-check.
 """
-from irix.demo.run_gym_demo import main
+from irix.demo.run_gym_demo import _demo_motion_correlation_disambiguation, main
 from irix.pipeline.schema import (
     BandPlacementRequiredEvent,
     RepCompletedEvent,
@@ -10,6 +10,10 @@ from irix.pipeline.schema import (
     SetFatigueSummaryEvent,
     WeightConfirmedEvent,
 )
+
+
+def _rep_completed_events(events):
+    return [e for e in events if isinstance(e, RepCompletedEvent)]
 
 
 def test_run_gym_demo_end_to_end_no_errors():
@@ -38,6 +42,21 @@ def test_squat_zone_has_two_sets_worth_of_events_and_fatigue_summaries():
     # Session fatigue tracker accumulates across the two sets.
     assert fatigue_events[0].completed_sets_this_session == 1
     assert fatigue_events[1].completed_sets_this_session == 2
+
+    # Barbell tracking is wired in for squat (has a published velocity
+    # anchor) -- fatigue analysis should run on the calibrated m/s tier,
+    # not fall back to the joint-angular deg/s proxy.
+    for e in fatigue_events:
+        assert e.velocity_tier == "m_s"
+    # The second set's synthetic bar-velocity stream decays more per rep
+    # than the first (see run_gym_demo.main's velocity_decay_per_rep),
+    # so it should show a real, higher velocity loss.
+    assert fatigue_events[1].velocity_loss_pct > fatigue_events[0].velocity_loss_pct
+    assert fatigue_events[1].velocity_loss_zone in ("VL10", "VL20", "VL30", "VL45")
+
+    for e in _rep_completed_events(events):
+        assert e.mean_velocity_m_s is not None
+        assert e.estimated_rpe is not None
 
     # Weight geometry cross-check: one plausible, one flagged.
     consistent_flags = [e.geometry_consistent for e in weight_events]
@@ -73,3 +92,11 @@ def test_leg_press_zone_shows_band_placement_and_imu_fallback_on_occlusion():
     assert set_event.rep_count_agreement is False
     assert set_event.rep_count_source == "imu_preferred_on_disagreement"
     assert set_event.fused_rep_count == set_event.imu_rep_count
+
+
+def test_motion_correlation_disambiguation_resolves_correctly():
+    # _demo_motion_correlation_disambiguation itself asserts correctness
+    # internally (verbose=True path) -- call it directly here so a
+    # regression trips a test failure with a real traceback, not just a
+    # silently-wrong printout the next time someone runs the demo by hand.
+    _demo_motion_correlation_disambiguation(verbose=True)

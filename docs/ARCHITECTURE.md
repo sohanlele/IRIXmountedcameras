@@ -567,6 +567,91 @@ toward squat-2 is correctly absorbed (no handoff, `is_authoritative`
 correctly stays `False` for squat-2), then a sustained 3-reading signal
 correctly triggers a real handoff.
 
+### Motion-correlation identity disambiguation (`irix/identity/motion_correlation.py`)
+
+BLE RSSI resolution (`irix.identity.ble_pairing`) answers "which station
+is this member's band closest to" -- it does not, and structurally
+cannot, answer "of the two people my camera sees at this station, which
+one is wearing which of these two members' bands". Both members'
+readings can legitimately resolve to the same station (a shared curl
+rack, two people training together, a crowded free-weights area) --
+`GymCoordinator.active_members_at(station_id)` returning more than one
+member is exactly that signal.
+
+`MotionCorrelationResolver` disambiguates by cross-correlating a
+vision-derived motion signal (the second derivative -- a Savitzky-Golay
+smoothed one, not naive double-differencing, which would amplify
+keypoint-tracking jitter by roughly `1/dt**2` -- of a tracked wrist
+keypoint's vertical position) against each candidate member's raw
+wristband accelerometer signal over the same window. The pairing with
+the highest correlation is assumed to be the same physical person: two
+different people's limb motion is essentially uncorrelated even doing
+similar exercises side by side, while a wristband's actual motion should
+closely track its wearer's own tracked wrist. This is not an invented
+technique -- it mirrors published person-identification systems that
+pair a camera-tracked skeleton to a specific wearable IMU this same way
+(e.g. the IEEE "Person tracking association using multi-modal systems"
+work matching a depth-camera skeleton to an inertial wearable via
+movement features), and the broader acceleration-correlation-based
+identification/synchronization literature more generally.
+
+Refuses to guess rather than force an assignment: if the best- and
+second-best-correlated candidates for a detected person are too close to
+call (`min_confidence_margin`), or a candidate's signal doesn't have
+enough valid overlapping samples to correlate at all, the result is
+`None` for that person -- the same "couldn't assess, don't fabricate an
+answer" posture `irix.form.rules` and `irix.fatigue` already take.
+Assignment is a simple greedy match (highest-confidence pairs claimed
+first, so no member gets assigned to two different detected people) --
+exact bipartite optimal matching wasn't judged necessary at the 2-3
+co-located-member scale this is meant for.
+
+**Known limitation, stated plainly**: a wearable's raw accelerometer
+measures gravity's changing projection as the wrist rotates, on top of
+translational motion; the vision-derived signal captures only
+translational motion (keypoint *position*, not orientation). That
+mismatch degrades the correlation somewhat -- the literature this is
+grounded in explicitly calls out gravity-direction compensation (a full
+3D wrist-orientation estimate) as the main accuracy lever for a
+production system, and this module doesn't attempt it. It leans instead
+on vertical motion being the dominant, well-correlated component for gym
+exercises specifically (squats/curls/presses/rows are all fundamentally
+vertical and cyclic), which is enough to disambiguate a *small* number of
+co-located candidates, not a claim of general-purpose, camera-angle-
+agnostic re-identification.
+
+`GymCoordinator.disambiguate_by_motion()` is the integration point --
+delegates straight to `MotionCorrelationResolver.resolve()`, so a caller
+that already has a `GymCoordinator` doesn't need to wire up the identity
+module separately. See `irix.demo.run_gym_demo._demo_motion_correlation_disambiguation`
+for a runnable trace: two members ("carol", faster tempo; "dave", slower)
+both BLE-resolve to `curl-1`, and the camera's two detected skeletons get
+correctly matched to the right member from wrist-motion timing alone.
+
+### Barbell tracking in the multi-station demo
+
+`irix.demo.run_gym_demo`'s squat sets run with `with_barbell_tracking=True`
+(mirroring `run_demo.py --with-barbell-tracking`): a synthetic barbell-
+pixel stream through `BarPathTracker`/`RPETracker` gives each rep a
+calibrated `mean_velocity_m_s`, not just the joint-angular `deg_s` proxy.
+This matters specifically for `irix.fatigue.SetFatigueAnalyzer`'s tier
+selection: without it, every set analysis silently fell back to the
+`deg_s` tier, and `velocity_loss_pct` computed from joint-angular
+velocity is only a *directional* proxy (see `irix.rep_counting`'s own
+docstrings on this) -- the VL10/VL20/VL30/VL45 zone thresholds
+`irix.barbell.rpe`'s citations validate were derived from calibrated bar
+velocity, not a joint-angle proxy, so classifying a set into one of those
+zones is only as trustworthy as the tier backing it. With barbell
+tracking wired in, the demo's two squat sets show real VL-zone
+progression (VL10 -> VL30 across the two sets, with `session_fatigue_index`
+climbing from ~0.09 to ~0.20) instead of the near-zero noise the
+deg/s-tier proxy showed on a synthetic angle stream whose rep-to-rep
+shape barely changes. `leg_press`/`bicep_curl` still run on the `deg_s`
+tier here (no published velocity anchor for either in
+`EXERCISE_1RM_VELOCITY_MS`) -- exactly the same two-tier fallback
+pattern used everywhere else in this repo, working as intended rather
+than silently degrading.
+
 ### Fatigue analysis: set and session level (`irix/fatigue/`)
 
 `docs/ARCHITECTURE.md` previously described this repo's fatigue-related
