@@ -45,6 +45,15 @@ class Keypoint:
     x: float
     y: float
     confidence: float
+    # Populated only for a keypoint that came out of multi-view
+    # triangulation (see irix.pose.multiview.triangulate_pose) -- a
+    # single camera's 2D pose leaves this None, same as every keypoint
+    # produced anywhere else in this repo before multi-view fusion
+    # existed. Downstream consumers (RepSession.process_frame) prefer
+    # the 3D position when present and fall back to the 2D (x, y) pair
+    # otherwise, so this is purely additive: nothing that never sets z
+    # changes behavior.
+    z: Optional[float] = None
 
 
 @dataclass
@@ -66,6 +75,18 @@ class PersonPose:
         if kp is None:
             return None
         return np.array([kp.x, kp.y])
+
+    def xyz(self, name: str) -> Optional[np.ndarray]:
+        """The keypoint's triangulated 3D position, if this pose came
+        from irix.pose.multiview.triangulate_pose and that keypoint had
+        enough agreeing camera views this tick -- None for an ordinary
+        single-camera 2D pose, or for a keypoint multi-view fusion
+        couldn't triangulate this tick (not enough views saw it above
+        the confidence threshold)."""
+        kp = self.get(name)
+        if kp is None or kp.z is None:
+            return None
+        return np.array([kp.x, kp.y, kp.z])
 
 
 class PoseEstimator:

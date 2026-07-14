@@ -217,7 +217,19 @@ class RepSession:
         if person is None:
             return events
         a_name, v_name, c_name = self.exercise.joint_triplet
-        a, v, c = person.xy(a_name), person.xy(v_name), person.xy(c_name)
+        # Prefer a triangulated 3D joint angle when this pose came from
+        # multi-view fusion (irix.pose.multiview.triangulate_pose, wired
+        # in via MultiCameraZoneRunner) and all 3 needed keypoints
+        # triangulated this tick -- a 3D angle isn't subject to any one
+        # camera's foreshortening/self-occlusion, so it's strictly more
+        # accurate than a single 2D view's angle whenever it's
+        # available. Falls back to the ordinary 2D angle otherwise
+        # (always true for the single-camera case, and for multi-view
+        # ticks where fewer than 2 cameras covered one of these 3
+        # specific keypoints) -- see PersonPose.xyz's docstring.
+        a, v, c = person.xyz(a_name), person.xyz(v_name), person.xyz(c_name)
+        if a is None or v is None or c is None:
+            a, v, c = person.xy(a_name), person.xy(v_name), person.xy(c_name)
         if a is None or v is None or c is None:
             return events
         angle = joint_angle(a, v, c)

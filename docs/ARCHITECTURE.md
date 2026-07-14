@@ -104,7 +104,7 @@ is a placeholder pointed at wherever that endpoint ends up.
 |---|---|---|
 | 4.1 Pose estimation model | `irix/pose/` | YOLO-Pose wrapper (`ultralytics`, optional dep); joint-angle geometry helper. Real, working pretrained weights -- see "Model weights" above |
 | 4.2 Rep-counting logic | `irix/rep_counting/` | Joint-angle state machine + per-exercise configs (squat/curl/deadlift/leg_press/hack_squat); each completed rep also carries inter-rep duration + peak/mean angular velocity for fatigue tracking (see below) |
-| 4.3 Multi-camera fusion & occlusion | -- | Not implemented; `PoseEstimator` returns single-view poses per camera, multi-view reprojection is future work |
+| 4.3 Multi-camera fusion & occlusion | `irix/pose/multiview.py` | DLT triangulation of a 3D pose from 2+ calibrated overlapping cameras' 2D keypoints, optionally wired into `MultiCameraZoneRunner` -- see "Overlapping multi-camera zones" below |
 | 4.4 Weight & plate recognition | `irix/weight_recognition/` | VLM-based classifier (`vision_classifier.py`) is the deployable path -- see below for why QR stickers and OCR were both ruled out; `confirmation.py` adds N-of-M read-confirmation windowing |
 | 4.5 Bar path & velocity tracking | `irix/barbell/` | Self-calibrated (no environment edits) barbell/plate/dumbbell detection, real-unit (m/s) bar-path velocity, and RPE/fatigue estimation -- see "Barbell and dumbbell tracking" below |
 | 4.6 Visual-inertial sensor fusion | `irix/fusion/` | EKF (position/velocity state) + ZUPT dead-stop correction; `imu_rep_counting.py` adds two literature IMU-only rep counters (see below) |
@@ -1157,6 +1157,70 @@ calibration for the samples it produced (not camera A's scale misapplied
 to camera B's pixels); `camera_tilt_deg_by_camera` overrides thread
 through correctly; and the single-camera case (`camera_id=None`
 throughout) is unaffected.
+
+**Multi-view 3D pose triangulation (`irix.pose.multiview`).** Everything
+above solves *identity* across overlapping cameras (which physical
+person is which wristband) and, per tick, still only feeds `RepSession`
+one camera's single 2D-pixel pose. `irix.pose.multiview.triangulate_pose`
+goes one step further: once 2+ cameras are already known (via that same
+identity resolution) to be looking at the same physical person, it
+DLT-triangulates (`triangulate_point`, the standard direct-linear-
+transform multi-view geometry solution, Hartley & Zisserman ch. 12) each
+of the 17 COCO keypoints independently from whichever subset of cameras
+currently sees it above a confidence threshold, into one fused 3D
+`PersonPose`. `CameraProjection` is a standard calibrated pinhole camera
+model (intrinsic `K` + extrinsic `R`/`t` within one shared zone-wide
+coordinate frame) -- deliberately a different thing from
+`irix.barbell.calibration.CameraCalibration`'s scalar px-per-mm
+conversion, which knows nothing about where a camera actually sits in 3D
+space. A real deployment derives `R`/`t` once per camera at install time
+via a standard extrinsic calibration procedure (checkerboard/ArUco
+marker visible to 2+ cameras, solved with OpenCV's
+`stereoCalibrate`/`solvePnP`) -- out of scope for this module, which
+assumes those numbers are already known.
+
+**Why this matters for rep counting, not just "more accurate in
+general."** `RepCounter` counts reps off a joint angle computed from a
+single camera's 2D pixel keypoints -- a *projection* of the true 3D
+angle onto that one camera's image plane, which foreshortens whenever
+the limb isn't moving parallel to that camera's image plane and can be
+wrong entirely when a keypoint is self-occluded from that particular
+angle (e.g. a barbell blocking the hip at a squat's bottom, exactly the
+position that matters most for rep detection). `RepSession.process_frame`
+now prefers a triangulated 3D joint angle over the 2D one whenever all 3
+of an exercise's needed keypoints (`irix.rep_counting.exercises.
+EXERCISES[...].joint_triplet`) triangulated that tick (`PersonPose.xyz`,
+via a new optional `z` field on `Keypoint` -- `None` for an ordinary 2D
+pose, so this is purely additive and doesn't change single-camera
+behavior at all), falling back to the 2D angle otherwise.
+
+**Wiring: opt-in via `MultiCameraZoneRunner(camera_projections=...)`.**
+Without it (the default), this runner's behavior is byte-for-byte
+unchanged from before multi-view fusion existed. With it, both tick
+paths gather *every* camera that resolved a pose for a given member that
+tick (not just the priority-winner used for weight/barbell detection --
+see `MultiCameraZoneRunner.tick`'s `all_routed_this_tick`/`poses_by_camera`
+collections) and triangulate across them; the fused pose (when
+triangulation succeeds) is what gets passed into `RepSession.
+process_frame`, while the single priority-winning camera's raw frame
+still feeds weight/barbell detection unchanged.
+
+`tests/test_multiview.py` covers the triangulation math directly against
+synthetic calibrated cameras (recovers a known 3D point exactly from 2 or
+3 views; returns `None` for a single view; per-keypoint view-count/
+confidence gating; unusable/missing-projection cameras are simply
+ignored, never crash). `tests/test_rep_session_multiview.py` proves
+`RepSession` actually prefers the 3D angle when available and falls back
+correctly when only some of a joint triplet's keypoints triangulated.
+`tests/test_zone_runner_multiview.py` is the end-to-end proof: a
+synthetic bicep-curl motion whose forearm swings through a camera's
+*depth* axis is fed through `MultiCameraZoneRunner` two ways -- one
+camera alone (deliberately positioned so its 2D pixel reading is
+degenerate: shoulder/elbow/wrist all share world x=0, so that camera's
+projected keypoints always land on the same pixel column, making its 2D
+"angle" reading meaningless) vs. both cameras with `camera_projections`
+configured. The fused run's rep count matches a ground-truth `RepCounter`
+run fed the true 3D angle directly; the single-camera run's does not.
 
 ## End-to-end demo
 

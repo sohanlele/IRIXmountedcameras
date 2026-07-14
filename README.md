@@ -292,8 +292,15 @@ Bar-path velocity calibration is per-camera-aware: each camera_id
 self-calibrates its own px-per-mm scale independently, so if a member's
 set switches from one physical camera to another mid-set, the velocity
 math switches to that camera's own calibration rather than misapplying
-the first camera's -- see `docs/ARCHITECTURE.md`'s "Overlapping
-multi-camera zones" section for the full reasoning.
+the first camera's. Optionally, when a geometric camera calibration
+(`irix.pose.multiview.CameraProjection`) is supplied per camera,
+`MultiCameraZoneRunner` triangulates a 3D pose from every camera that
+currently sees a member, and rep counting uses that fused 3D joint angle
+instead of a single camera's 2D one whenever available -- immune to any
+one camera's foreshortening or self-occlusion of the joint that matters,
+not just tolerant of losing sight of the person entirely. See
+`docs/ARCHITECTURE.md`'s "Overlapping multi-camera zones" section for the
+full reasoning on all of the above.
 
 ## Test
 
@@ -305,7 +312,7 @@ pytest
 
 ```
 irix/
-  pose/              pose estimation (YOLO-Pose wrapper) + joint-angle geometry
+  pose/              pose estimation (YOLO-Pose wrapper) + joint-angle geometry + multiview.py (DLT triangulation of a 3D pose from 2+ calibrated overlapping cameras, optional input to MultiCameraZoneRunner)
   rep_counting/       joint-angle state machine + per-exercise configs; each rep carries duration + peak/mean velocity for fatigue tracking, tracking_confidence for fusion, and optionally the buffered poses for form scoring
   form/               rule-based per-rep fault detection (knee valgus, insufficient depth, leaning back, elbow drift, hips-rising-before-chest), populates RepCompletedEvent.form_score/form_faults
   fusion/             visual-inertial EKF + ZUPT dead-stop correction; RecoFit/uLift wristband IMU-only rep counters; rep_fusion.py reconciles camera + IMU set-level rep counts into one authoritative count; imu_io.py loads a real recorded wristband export (CSV/JSON) into IMUSamples; imu_stream.py is the live-vs-recorded IMUStream protocol (RecordedIMUStream real, LiveBLEIMUStream a documented hardware-scope stub)

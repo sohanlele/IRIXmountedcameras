@@ -68,6 +68,21 @@ docstrings for the mechanics. Joint-angle-based rep counting was never
 affected by this either way (joint angles are relative measurements
 between a frame's own keypoints, not dependent on any absolute px-per-mm
 calibration).
+
+**Optional multi-view 3D pose fusion.** When ``camera_projections`` is
+given (a geometric camera calibration per ``camera_id`` -- see
+``irix.pose.multiview``'s module docstring), this runner triangulates a
+3D pose from every camera that currently resolves a pose for a given
+member in a tick (not just the priority-winner used for weight/barbell
+detection), via ``irix.pose.multiview.triangulate_pose``. That 3D pose is
+what actually gets fed into ``RepSession.process_frame`` -- ``RepSession``
+prefers a triangulated 3D joint angle over a single camera's 2D one
+whenever all 3 of an exercise's needed keypoints triangulated that tick
+(see its own docstring), so rep counting becomes immune to any one
+camera's foreshortening or self-occlusion of the joint that matters, not
+just tolerant of losing sight of the person entirely. This is strictly
+opt-in: without ``camera_projections`` (the default), this runner behaves
+exactly as before -- single 2D pose, one camera per tick.
 """
 from __future__ import annotations
 
@@ -85,6 +100,7 @@ from ..identity.motion_correlation import MotionCorrelationResolver
 from ..pipeline.rep_session import RepSession
 from ..pipeline.schema import CameraEvent
 from ..pose.estimator import PersonPose
+from ..pose.multiview import CameraProjection, triangulate_pose
 from ..weight_recognition.vlm_backend import VLMBackend
 from .disambiguation import CrowdedGroupDisambiguator
 
@@ -126,6 +142,7 @@ class MultiCameraZoneRunner:
         motion_resolver: Optional[MotionCorrelationResolver] = None,
         disambiguation_window_frames: int = 60,
         camera_tilt_deg_by_camera: Optional[Dict[str, float]] = None,
+        camera_projections: Optional[Dict[str, CameraProjection]] = None,
     ):
         """``cameras``: every camera covering this zone, in a fixed
         priority order -- when 2+ cameras resolve a pose for the same
@@ -148,6 +165,13 @@ class MultiCameraZoneRunner:
         travel plane -- this lets each one get its own correction rather
         than sharing one value across the whole zone.
 
+        ``camera_projections``: optional ``camera_id -> CameraProjection``
+        geometric calibration map -- when given, enables multi-view 3D
+        pose triangulation (see module docstring's "Optional multi-view
+        3D pose fusion" section and ``irix.pose.multiview``). Omitted
+        (the default), this runner's behavior is unchanged from before
+        multi-view fusion existed.
+
         Every other parameter mirrors ``StationSessionRunner``'s
         constructor exactly -- see that class's docstring for the ones
         not re-explained here.
@@ -161,6 +185,7 @@ class MultiCameraZoneRunner:
         self.ble_reader = ble_reader
         self.imu_stream_factory = imu_stream_factory
         self.presence_timeout_s = presence_timeout_s
+        self.camera_projections = camera_projections or {}
         self._clock = clock or time.monotonic
         self._session_kwargs = dict(
             vlm_backend=vlm_backend,
@@ -257,19 +282,44 @@ class MultiCameraZoneRunner:
             session = self._sessions.get(wristband_id)
             if session is None:
                 return
-            # Only one member in the whole zone -- no ambiguity possible.
-            # Take the first camera (priority order) that currently sees
-            # anyone at all; never feed more than one camera's pose in
-            # the same tick, same double-counting guard as the ambiguous
-            # path below.
+            # Only one member in the whole zone -- no identity ambiguity
+            # possible. Without camera_projections (the common case), this
+            # stays exactly the pre-multi-view-fusion behavior: take the
+            # first camera (priority order) that currently sees anyone at
+            # all, feed only that one, same double-counting guard as the
+            # ambiguous path below. With camera_projections configured,
+            # every camera that currently sees this lone member is polled
+            # (not just the first) so their poses can be triangulated into
+            # one 3D pose -- see module docstring's "Optional multi-view
+            # 3D pose fusion" section.
+            if not self.camera_projections:
+                for camera in self.cameras:
+                    frame = frames.get(camera.camera_id)
+                    if frame is None:
+                        continue
+                    people = self._ensure_estimator(camera).estimate(frame)
+                    if people:
+                        self._on_events(session.process_frame(frame, now, people[0], camera_id=camera.camera_id))
+                        break
+                return
+
+            poses_by_camera: Dict[str, PersonPose] = {}
+            first_frame: Optional[np.ndarray] = None
+            first_camera_id: Optional[str] = None
             for camera in self.cameras:
                 frame = frames.get(camera.camera_id)
                 if frame is None:
                     continue
                 people = self._ensure_estimator(camera).estimate(frame)
                 if people:
-                    self._on_events(session.process_frame(frame, now, people[0], camera_id=camera.camera_id))
-                    break
+                    poses_by_camera[camera.camera_id] = people[0]
+                    if first_frame is None:
+                        first_frame, first_camera_id = frame, camera.camera_id
+            if not poses_by_camera:
+                return
+            fused = triangulate_pose(poses_by_camera, self.camera_projections)
+            pose = fused if fused is not None else poses_by_camera[first_camera_id]
+            self._on_events(session.process_frame(first_frame, now, pose, camera_id=first_camera_id))
             return
 
         candidate_ids = frozenset(present_set)
@@ -281,6 +331,13 @@ class MultiCameraZoneRunner:
         # module docstring's "Bar-path calibration is per-camera-aware"
         # section).
         routed_this_tick: Dict[str, Tuple[str, np.ndarray, PersonPose]] = {}
+        # camera_id -> pose for every camera that resolved *this* member
+        # this tick, not just the priority-winner above -- feeds
+        # triangulate_pose below when camera_projections is configured,
+        # so a member seen by 2+ cameras this tick can get a fused 3D
+        # pose even though only one (camera_id, frame) pair is used for
+        # weight/barbell detection.
+        all_routed_this_tick: Dict[str, Dict[str, PersonPose]] = {}
         for camera in self.cameras:
             frame = frames.get(camera.camera_id)
             if frame is None:
@@ -292,11 +349,18 @@ class MultiCameraZoneRunner:
             for wristband_id, pose in routed.items():
                 if wristband_id not in routed_this_tick:
                     routed_this_tick[wristband_id] = (camera.camera_id, frame, pose)
+                all_routed_this_tick.setdefault(wristband_id, {})[camera.camera_id] = pose
 
         for wristband_id, (camera_id, frame, pose) in routed_this_tick.items():
             session = self._sessions.get(wristband_id)
-            if session is not None:
-                self._on_events(session.process_frame(frame, now, pose, camera_id=camera_id))
+            if session is None:
+                continue
+            fused_pose = pose
+            if self.camera_projections and len(all_routed_this_tick.get(wristband_id, {})) >= 2:
+                fused = triangulate_pose(all_routed_this_tick[wristband_id], self.camera_projections)
+                if fused is not None:
+                    fused_pose = fused
+            self._on_events(session.process_frame(frame, now, fused_pose, camera_id=camera_id))
 
     def run_forever(self, max_frames: Optional[int] = None) -> None:
         """Runs until every camera's ``frame_source`` is exhausted (only
