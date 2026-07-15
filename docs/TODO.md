@@ -120,6 +120,23 @@ completed this phase removed, new gaps this phase's work surfaced added.
       `plate_geometry_check` both become strictly more useful (a real
       bounding box to crop color regions from, instead of this phase's
       standalone color-blob detection).
+- [ ] **Machine weight-stack reading** (Priority 7's "machine stacks") --
+      genuinely not started. Plate-loaded free-weight equipment
+      (color-coded bumper plates, VLM read) is the only load-bearing
+      equipment type this repo can read at all; a selectorized machine's
+      pin-in-stack weight (a printed number on a metal plate, read via
+      OCR or a small trained detector, not a bumper-plate color) has no
+      implementation, no research entry, and no test coverage yet. Real,
+      not-yet-attempted work, not a stub -- would need either an OCR
+      model (e.g. a lightweight digit-recognition model, since general
+      OCR on stamped metal in variable gym lighting is a harder problem
+      than printed-page OCR) or example machine-stack images to even
+      start on, neither of which exist in this environment.
+- [ ] **Printed-plate OCR** (Priority 7's "OCR") as a fallback for
+      non-color-coded plates (the common case for commercial-gym cast-
+      iron/rubber plates -- see `plate_color_check.py`'s own "what this
+      doesn't cover" note) -- same real gap as machine-stack reading
+      above, same blocker (no OCR model, no labeled data here).
 - [ ] **Real pose-inference + GPU benchmarks** once `ultralytics`/CUDA
       are available (not in this sandboxed environment) --
       `irix.benchmark.benchmark_pose_inference`/`_gpu_available` already

@@ -84,7 +84,14 @@ no-API-key color-coded-bumper-plate detection (Phase 3 default).
 plate-count cross-check against the barbell detector's own read) and
 `color_check_consistent`/`color_check_reason` (cross-check between the
 VLM and color-plate reads when both ran) -- either pair is `None` when
-that particular check wasn't run for this reading.
+that particular check wasn't run for this reading. `status` (Phase 3,
+Priority 7) is always `"confirmed"` today -- present as an explicit
+field, not just implied by the event existing, so a future
+candidate-level surface can reuse this same shape. `units` (Phase 3) is
+always `"kg"`. `RepSession`'s `bar_weight_kg` constructor param (Phase 3,
+default the men's Olympic 20kg bar) is this station's actual equipment
+metadata feeding the color-plate total -- a women's/technique bar station
+should set it explicitly.
 
 ### `StationHandoffEvent`
 A member's authoritative station changed. `member_id`, `from_station`,

@@ -232,6 +232,23 @@ class WeightConfirmedEvent:
     # weight-check block), same "unknown over incorrect" principle as
     # everywhere else in this repo.
     method: str = "vlm"
+    # Always "confirmed" today -- this event, by construction, is never
+    # constructed for a candidate/unconfirmed read (RepSession only
+    # builds one after VLM confirm_n-of-confirm_window agreement, or a
+    # color-plate read that already passed its own symmetric-pair check
+    # -- see process_frame's weight-check block). Present as an explicit
+    # field, not just implied by "this event exists at all", so a future
+    # candidate-level surface (e.g. a live ops/debug view showing an
+    # in-progress, not-yet-confirmed read) can reuse this same event
+    # shape instead of inventing a second one -- Priority 7's "status
+    # (candidate/confirmed/unknown)" requirement made explicit now, ahead
+    # of that future surface actually existing.
+    status: str = "confirmed"
+    # Always "kg" today (every weight_kg value in this repo already is
+    # kilograms) -- explicit per Priority 7's "every detected load must
+    # include ... units" requirement, rather than leaving the unit
+    # implied by the field name alone.
+    units: str = "kg"
 
     def to_dict(self) -> dict:
         return {
@@ -247,6 +264,8 @@ class WeightConfirmedEvent:
             "color_check_consistent": self.color_check_consistent,
             "color_check_reason": self.color_check_reason,
             "method": self.method,
+            "status": self.status,
+            "units": self.units,
         }
 
 

@@ -38,7 +38,9 @@ from ..pose.estimator import PersonPose
 from ..pose.geometry import joint_angle
 from ..rep_counting.exercises import EXERCISES
 from ..rep_counting.state_machine import RepCounter
-from ..weight_recognition.plate_color_check import detect_color_plates, estimate_load_from_color_plates
+from ..weight_recognition.plate_color_check import (
+    detect_color_plates, estimate_load_from_color_plates, MENS_OLYMPIC_BARBELL_WEIGHT_KG,
+)
 from ..weight_recognition.plate_geometry_check import check_plate_geometry
 from ..weight_recognition.vision_classifier import VisionPlateClassifier
 from ..weight_recognition.vlm_backend import VLMBackend
@@ -67,6 +69,7 @@ class RepSession:
         start_ts: Optional[float] = None,
         clock_sync_estimator: Optional[ClockSyncEstimator] = None,
         placement_tracker: Optional[WristbandPlacementTracker] = None,
+        bar_weight_kg: float = MENS_OLYMPIC_BARBELL_WEIGHT_KG,
     ):
         """``camera_tilt_deg``: the tilt correction to use for whichever
         camera's frames arrive without a more specific entry in
@@ -136,6 +139,14 @@ class RepSession:
         actually match, rather than silently fusing mismatched-limb
         samples. ``None`` (default) disables this -- every sample is
         trusted immediately, unchanged from pre-Phase-3 behavior.
+
+        ``bar_weight_kg``: this station's actual bar weight (Priority 7's
+        "equipment metadata" -- a women's bar, technique bar, or fixed
+        machine-arm equivalent is *not* always the men's Olympic 20kg
+        default ``irix.weight_recognition.plate_color_check.
+        estimate_load_from_color_plates`` otherwise silently assumes).
+        Defaults to that same 20kg constant for backward compatibility
+        with every existing caller that doesn't know or care.
         """
         if exercise_name not in EXERCISES:
             raise ValueError(f"Unknown exercise {exercise_name!r} -- choices: {sorted(EXERCISES)}")
@@ -147,6 +158,7 @@ class RepSession:
         self.barbell_detector = barbell_detector
         self.camera_tilt_deg = camera_tilt_deg
         self.camera_tilt_deg_by_camera = camera_tilt_deg_by_camera or {}
+        self.bar_weight_kg = bar_weight_kg
 
         self.counter = RepCounter(self.exercise)
         self.form_scorer = FormScorer()
@@ -257,7 +269,7 @@ class RepSession:
         # -- weight recognition (periodic; color-plate check always runs
         # since it needs no model/API key, VLM only if configured) --
         if self._frame_count % self.weight_check_every_n_frames == 0:
-            color_estimate = estimate_load_from_color_plates(detect_color_plates(frame))
+            color_estimate = estimate_load_from_color_plates(detect_color_plates(frame), bar_weight_kg=self.bar_weight_kg)
             vlm_reading = self.weight_classifier.read_frame(frame) if self.weight_classifier is not None else None
 
             if vlm_reading is not None:

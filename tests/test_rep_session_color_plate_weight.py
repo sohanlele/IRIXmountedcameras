@@ -75,3 +75,30 @@ def test_an_unpaired_single_plate_is_not_confidently_readable_and_produces_no_ev
     events = session.process_frame(frame=img, ts=0.0, person=None)
 
     assert not [e for e in events if e.to_dict()["event_type"] == "weight_confirmed"]
+
+
+def test_color_plate_confirmed_event_carries_status_and_units():
+    session = RepSession(
+        exercise_name="squat", member_id="alice", station_id="squat-1", weight_check_every_n_frames=1,
+    )
+    frame = _frame_with_symmetric_plates("blue")
+
+    events = session.process_frame(frame=frame, ts=0.0, person=None)
+    weight_event = next(e for e in events if e.to_dict()["event_type"] == "weight_confirmed")
+    assert weight_event.status == "confirmed"
+    assert weight_event.units == "kg"
+
+
+def test_a_non_default_bar_weight_is_used_for_color_plate_totals():
+    # A women's Olympic bar (15kg) instead of the 20kg default -- this
+    # station's equipment metadata should change the total, not just the
+    # plates detected.
+    session = RepSession(
+        exercise_name="squat", member_id="alice", station_id="squat-1",
+        weight_check_every_n_frames=1, bar_weight_kg=15.0,
+    )
+    frame = _frame_with_symmetric_plates("blue")  # 2x 20kg plates
+
+    events = session.process_frame(frame=frame, ts=0.0, person=None)
+    weight_event = next(e for e in events if e.to_dict()["event_type"] == "weight_confirmed")
+    assert weight_event.weight_kg == 20.0 * 2 + 15.0
