@@ -1,0 +1,83 @@
+# Example irix.config.gym_config.GymConfig -- a 10-camera single-floor
+# gym matching the layout irix.topology.registry's demo default and
+# irix.demo.run_gym_demo already use, expressed as an actual loadable
+# config file instead of hardcoded Python literals. Load with
+# irix.config.load_gym_config("configs/example_gym.yaml").
+#
+# Copy this file per real gym install and edit station_id/camera_id/
+# zone/exercise/adjacent_station_ids to match that gym's actual floor
+# plan, and bar_weight_kg for any station with non-standard equipment
+# (a women's/technique bar, not the 20kg men's Olympic default).
+gym_id: example-gym-1
+
+stations:
+  - station_id: squat-1
+    camera_id: cam-1
+    zone: free_weights
+    exercise: squat
+    adjacent_station_ids: [squat-2, deadlift-1]
+  - station_id: squat-2
+    camera_id: cam-2
+    zone: free_weights
+    exercise: squat
+    adjacent_station_ids: [squat-1, deadlift-1]
+  - station_id: bench-1
+    camera_id: cam-3
+    zone: free_weights
+    exercise: bench_press
+    adjacent_station_ids: [squat-1, bench-2]
+  - station_id: bench-2
+    camera_id: cam-4
+    zone: free_weights
+    exercise: bench_press
+    adjacent_station_ids: [bench-1, deadlift-1]
+  - station_id: deadlift-1
+    camera_id: cam-5
+    zone: platform
+    exercise: deadlift
+    adjacent_station_ids: [squat-2, bench-2, curl-1]
+  - station_id: curl-1
+    camera_id: cam-6
+    zone: dumbbell
+    exercise: bicep_curl
+    adjacent_station_ids: [deadlift-1, curl-2]
+  - station_id: curl-2
+    camera_id: cam-7
+    zone: dumbbell
+    exercise: bicep_curl
+    adjacent_station_ids: [curl-1, leg-press-1]
+  - station_id: leg-press-1
+    camera_id: cam-8
+    zone: machines
+    exercise: leg_press
+    adjacent_station_ids: [curl-2, leg-press-2]
+  - station_id: leg-press-2
+    camera_id: cam-9
+    zone: machines
+    exercise: leg_press
+    adjacent_station_ids: [leg-press-1, hack-squat-1]
+  - station_id: hack-squat-1
+    camera_id: cam-10
+    zone: machines
+    exercise: hack_squat
+    adjacent_station_ids: [leg-press-2]
+    # Example of a non-default equipment override -- this station's
+    # hack squat sled happens to use a 25kg loading arm instead of the
+    # generic 20kg default:
+    bar_weight_kg: 25.0
+
+thresholds:
+  presence_timeout_s: 5.0
+  rest_gap_s: 20.0
+  tracking_lost_after_frames: 15
+  min_consecutive: 3
+  rssi_tie_margin: 3.0
+  weight_check_every_n_frames: 30
+
+ble_gateway:
+  packet_loss_pct: 0.02
+  rssi_at_station_dbm: -55.0
+  rssi_noise_std: 2.0
+
+compute:
+  mode: cpu

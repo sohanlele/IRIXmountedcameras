@@ -202,8 +202,15 @@ completed this phase removed, new gaps this phase's work surfaced added.
       matching beyond IOU+motion -- deliberately not built this phase
       (see `irix/pose/tracker.py`'s module docstring for why IOU+Kalman
       is sufficient at gym-station scale today).
-- [ ] **External config system** for per-gym station/camera layout
-      (still open -- see `docs/DEPLOYMENT.md`).
+- [x] ~~External config system for per-gym station/camera layout~~ --
+      done (Priority 10): `irix.config.gym_config`. Not yet wired: no
+      entry point actually loads a `GymConfig` and constructs a live
+      `GymSessionRunner`/`StationSessionRunner` set from it end-to-end --
+      every current demo/live entry point still builds its `StationInfo`
+      list and per-station kwargs inline. That wiring (a `build_gym_
+      session_runner(config, ...)`-style factory, hardware bindings
+      still supplied by the caller) is the natural next step, not yet
+      built.
 
 ## Lower priority / longer-term
 

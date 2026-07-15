@@ -53,12 +53,20 @@ See the top-level README for the full flag reference on each.
   project in the business workspace, which does ship one -- worth using
   as a structural reference, not reusing directly, since its stack is
   FastAPI + React + Postgres, not this repo's edge-inference shape).
-- **Configuration system** -- station/camera layout is currently
-  constructed in Python (`StationRegistry([...])`, see
-  `docs/CAMERA_SYSTEM.md`) rather than loaded from an external config
-  file (YAML/JSON/env). Fine for tests and demos; a real per-gym
-  deployment would want per-site config without a code change. See
-  `docs/TODO.md`.
+- ~~**Configuration system**~~ -- done (Phase 3, Priority 10):
+  `irix.config.gym_config.GymConfig` loads a per-gym YAML/JSON file
+  (station/camera layout, per-station equipment metadata, thresholds,
+  BLE gateway parameters, compute mode) and
+  `build_station_registry`/`rep_session_kwargs_for`/
+  `station_runner_kwargs_for` build the real runtime objects from it --
+  see `configs/example_gym.yaml` for a complete example matching this
+  repo's existing 10-station demo layout. Deliberately does **not**
+  configure hardware bindings (`frame_source`/`ble_reader`/
+  `imu_stream_factory`/`pose_estimator` stay caller-supplied callables --
+  see the module docstring for why) or camera calibration numbers
+  themselves (`StationConfig.calibration_profile_path` points at a
+  separately-produced `irix.pose.calibration.CalibrationProfile` file,
+  not duplicated inline).
 - **Wristband hardware + firmware** -- see `docs/WRISTBAND_SYSTEM.md`'s
   hardware recommendation section. Not purchased, not built.
 - **Camera network/PoE topology, RTSP credentials management** -- out of

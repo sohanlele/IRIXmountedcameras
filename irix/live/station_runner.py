@@ -76,6 +76,7 @@ from __future__ import annotations
 import time
 from typing import Callable, Dict, List, Optional
 
+from ..barbell.calibration import MENS_OLYMPIC_BARBELL_WEIGHT_KG
 from ..barbell.detector import FreeWeightDetector
 from ..fusion.clock_sync import ClockSyncEstimator, apply_clock_sync
 from ..fusion.imu import IMUSample
@@ -107,6 +108,7 @@ class StationSessionRunner:
         weight_check_every_n_frames: int = 30,
         barbell_detector: Optional[FreeWeightDetector] = None,
         rest_gap_s: float = 20.0,
+        bar_weight_kg: float = MENS_OLYMPIC_BARBELL_WEIGHT_KG,
         on_events: Optional[Callable[[List[CameraEvent]], None]] = None,
         clock: Optional[Callable[[], float]] = None,
         motion_resolver: Optional[MotionCorrelationResolver] = None,
@@ -197,6 +199,7 @@ class StationSessionRunner:
             weight_check_every_n_frames=weight_check_every_n_frames,
             barbell_detector=barbell_detector,
             rest_gap_s=rest_gap_s,
+            bar_weight_kg=bar_weight_kg,
         )
         self._on_events = on_events or (lambda events: None)
         self._disambiguator = CrowdedGroupDisambiguator(
