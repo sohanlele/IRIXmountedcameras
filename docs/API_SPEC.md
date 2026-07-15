@@ -106,6 +106,46 @@ prescriptive instruction ("reduce the weight"); that judgment belongs to
 `irix-mvp-app`'s AI layer, not this repo (see
 `docs/PRODUCT_SPEC.md`).
 
+### `TrackingLostEvent` / `TrackingRecoveredEvent` (Phase 3)
+A member stopped being detected (`TrackingLostEvent`:
+`consecutive_missed_frames`) for long enough to be a real loss, not one
+missed frame, and later was detected again (`TrackingRecoveredEvent`:
+`gap_duration_s`). Wired for `StationSessionRunner`'s single-candidate
+path only -- see `docs/TODO.md` for the crowded-station gap.
+
+### `RestStartedEvent` / `RestEndedEvent` (Phase 3)
+`member_id`, `station_id`, `exercise`, plus `rest_duration_s` on the
+`Ended` event. **Not yet emitted by anything** -- needs a live
+between-tick timer; see `docs/TODO.md`.
+
+### `ExerciseDetectedEvent` (Phase 3)
+`member_id`, `station_id`, `exercise`, `confidence` --
+`irix.exercise_recognition.recognize_exercise`'s output, once wired into
+a session-start decision. **Not yet emitted by anything**; see
+`docs/TODO.md`.
+
+## Workout state machine (Phase 3)
+
+`irix.pipeline.workout_state.WorkoutStateMachine` -- one per wristband
+for its whole gym visit (owned by `irix.live.gym_runner.
+GymSessionRunner`, not any single station -- see that module's and
+`workout_state`'s docstrings for why). Models the founding brief's 19
+named states as an ordered `WorkoutPhase` sequence plus independent
+`WorkoutHealth` flags (`identity_degraded`, `camera_connected`,
+`ble_connected`), and enforces, by construction: no duplicate sessions
+(`session_started` only legal once per machine), no late packets
+reopening a completed set (`rep_completed` only legal while
+`phase == SET_STARTED`; a stale index is rejected as a duplicate), no
+duplicate reps (monotonic rep index per set), and a mechanism for
+preventing camera-overlap double counting (`record_camera_handoff`
+tracks exactly one "current" camera per member). Not a replacement for
+any existing lower-level guard (`RepCounter`'s hysteresis,
+`RepSession`'s clean set-close/reset, `GymCoordinator`'s
+authoritative-station gate all still do their own jobs unchanged) --
+this is the explicit, independently-checkable, named vocabulary layered
+on top. See `docs/TODO.md` for what's not yet wired (rep/set-level
+events from each `StationSessionRunner` into the gym-wide machine).
+
 ## Confidence fields
 
 Per the founding brief's "every event should include confidence"

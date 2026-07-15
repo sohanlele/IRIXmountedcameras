@@ -626,3 +626,82 @@ def test_disambiguator_receives_clock_synced_imu_not_raw_samples():
     seen_alice = resolver.seen_imu_streams[-1]["member-alice"]
     assert len(seen_alice) == len(raw_alice)
     assert seen_alice[0].timestamp == pytest.approx(raw_alice[0].timestamp - true_lead_s, abs=1e-9)
+
+
+class _IntermittentPoseEstimator:
+    """Returns a fixed pose for the first `visible_frames` calls, then
+    empty (nobody detected) for `missing_frames` calls, then the fixed
+    pose again -- simulates a real detector losing and regaining track."""
+
+    def __init__(self, pose, visible_frames, missing_frames):
+        self._pose = pose
+        self._visible_frames = visible_frames
+        self._missing_frames = missing_frames
+        self._i = 0
+
+    def estimate(self, frame):
+        self._i += 1
+        if self._i <= self._visible_frames:
+            return [self._pose]
+        if self._i <= self._visible_frames + self._missing_frames:
+            return []
+        return [self._pose]
+
+
+def test_tracking_lost_and_recovered_fire_after_a_missed_frame_streak():
+    from irix.pipeline.schema import TrackingLostEvent, TrackingRecoveredEvent
+
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    present = [BLEReading(station_id="station-1", rssi=-40.0, timestamp=0.0, wristband_id="band-1")]
+
+    n_frames = 30
+    estimator = _IntermittentPoseEstimator(_pose_for_angle(90.0), visible_frames=5, missing_frames=15)
+    events = []
+    runner = StationSessionRunner(
+        station_id="station-1",
+        exercise_name="squat",
+        checkout_registry=registry,
+        frame_source=_FakeFrameSource(n_frames),
+        ble_reader=_ScriptedBLEReader([present] * n_frames),
+        pose_estimator=estimator,
+        on_events=events.extend,
+        clock=_FakeClock(step=0.1),
+        tracking_lost_after_frames=10,
+    )
+    runner.run_forever(max_frames=n_frames)
+
+    lost = [e for e in events if isinstance(e, TrackingLostEvent)]
+    recovered = [e for e in events if isinstance(e, TrackingRecoveredEvent)]
+    assert len(lost) == 1
+    assert lost[0].member_id == "member-alice"
+    assert lost[0].consecutive_missed_frames == 10
+    assert len(recovered) == 1
+    assert recovered[0].member_id == "member-alice"
+    assert recovered[0].gap_duration_s > 0
+
+
+def test_a_brief_single_frame_miss_does_not_fire_tracking_lost():
+    from irix.pipeline.schema import TrackingLostEvent
+
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    present = [BLEReading(station_id="station-1", rssi=-40.0, timestamp=0.0, wristband_id="band-1")]
+
+    n_frames = 10
+    estimator = _IntermittentPoseEstimator(_pose_for_angle(90.0), visible_frames=3, missing_frames=1)
+    events = []
+    runner = StationSessionRunner(
+        station_id="station-1",
+        exercise_name="squat",
+        checkout_registry=registry,
+        frame_source=_FakeFrameSource(n_frames),
+        ble_reader=_ScriptedBLEReader([present] * n_frames),
+        pose_estimator=estimator,
+        on_events=events.extend,
+        clock=_FakeClock(step=0.1),
+        tracking_lost_after_frames=10,
+    )
+    runner.run_forever(max_frames=n_frames)
+
+    assert not [e for e in events if isinstance(e, TrackingLostEvent)]

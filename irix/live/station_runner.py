@@ -85,7 +85,7 @@ from ..identity.checkout import CheckoutRegistry
 from ..identity.motion_correlation import MotionCorrelationResolver
 from ..identity.placement import BandSide, WristbandPlacementTracker
 from ..pipeline.rep_session import RepSession
-from ..pipeline.schema import BandPlacementConfirmedEvent, CameraEvent
+from ..pipeline.schema import BandPlacementConfirmedEvent, CameraEvent, TrackingLostEvent, TrackingRecoveredEvent
 from ..pose.calibration import CalibrationProfile
 from ..weight_recognition.vlm_backend import VLMBackend
 from .disambiguation import CrowdedGroupDisambiguator
@@ -111,6 +111,7 @@ class StationSessionRunner:
         motion_resolver: Optional[MotionCorrelationResolver] = None,
         disambiguation_window_frames: int = 60,
         calibration_profile: Optional[CalibrationProfile] = None,
+        tracking_lost_after_frames: int = 15,
     ):
         """``ble_reader``: called once per frame tick (in ``run_forever``
         only -- ``tick()`` called directly, e.g. by ``irix.live.
@@ -153,6 +154,15 @@ class StationSessionRunner:
         any camera whose lens distortion hasn't been calibrated yet
         rather than silently running uncorrected pose estimation through
         a calibration step that doesn't exist for it.
+
+        ``tracking_lost_after_frames``: how many *consecutive* ticks with
+        nobody detected (the common single-candidate path only -- see
+        ``TrackingLostEvent``'s own docstring for the crowded-station
+        gap) before a ``TrackingLostEvent`` fires, paired with a
+        ``TrackingRecoveredEvent`` once someone is detected again.
+        Deliberately a streak, not a single missed frame -- an ordinary
+        detector miss on one frame (motion blur, brief self-occlusion)
+        shouldn't itself be reported as a tracking-loss incident.
         """
         self.station_id = station_id
         self.exercise_name = exercise_name
@@ -162,6 +172,7 @@ class StationSessionRunner:
         self.imu_stream_factory = imu_stream_factory
         self.pose_estimator = pose_estimator
         self.calibration_profile = calibration_profile
+        self.tracking_lost_after_frames = tracking_lost_after_frames
         self.presence_timeout_s = presence_timeout_s
         self._clock = clock or time.monotonic
         self._session_kwargs = dict(
@@ -178,6 +189,9 @@ class StationSessionRunner:
         self._sessions: Dict[str, RepSession] = {}
         self._imu_streams: Dict[str, Optional[IMUStream]] = {}
         self._last_seen: Dict[str, float] = {}
+        self._consecutive_missed_frames: Dict[str, int] = {}
+        self._tracking_lost: Dict[str, bool] = {}
+        self._tracking_lost_since: Dict[str, float] = {}
         # One ClockSyncEstimator per currently-open session (Phase 3
         # default production behavior) -- correction is applied to every
         # add_imu_samples() call from the moment it exists, but it starts
@@ -249,6 +263,9 @@ class StationSessionRunner:
         self._last_seen.pop(wristband_id, None)
         self._clock_sync_estimators.pop(wristband_id, None)
         self._placement_trackers.pop(wristband_id, None)
+        self._consecutive_missed_frames.pop(wristband_id, None)
+        self._tracking_lost.pop(wristband_id, None)
+        self._tracking_lost_since.pop(wristband_id, None)
         if session is not None:
             self._on_events(session.close(end_ts=end_ts))
         # A session ending always coincides with a present-set change,
@@ -287,6 +304,42 @@ class StationSessionRunner:
             at_time=at_time if at_time is not None else self._clock(), offset_s=offset_s, confidence=confidence,
         )
         return True
+
+    def _track_tracking_loss(self, wristband_id: str, person_detected: bool, now: float) -> List[CameraEvent]:
+        """Streak-based TrackingLostEvent/TrackingRecoveredEvent (see
+        __init__'s ``tracking_lost_after_frames`` docstring) for the
+        common single-candidate path. member_id is resolved fresh here
+        (not cached) since it never changes for an open session and this
+        avoids threading it through every caller."""
+        events: List[CameraEvent] = []
+        if person_detected:
+            self._consecutive_missed_frames[wristband_id] = 0
+            if self._tracking_lost.get(wristband_id):
+                self._tracking_lost[wristband_id] = False
+                since = self._tracking_lost_since.pop(wristband_id, now)
+                session = self._sessions.get(wristband_id)
+                member_id = session.member_id if session is not None else wristband_id
+                events.append(
+                    TrackingRecoveredEvent(
+                        member_id=member_id, station_id=self.station_id,
+                        gap_duration_s=max(0.0, now - since), timestamp=now,
+                    )
+                )
+            return events
+        missed = self._consecutive_missed_frames.get(wristband_id, 0) + 1
+        self._consecutive_missed_frames[wristband_id] = missed
+        if missed >= self.tracking_lost_after_frames and not self._tracking_lost.get(wristband_id):
+            self._tracking_lost[wristband_id] = True
+            self._tracking_lost_since[wristband_id] = now
+            session = self._sessions.get(wristband_id)
+            member_id = session.member_id if session is not None else wristband_id
+            events.append(
+                TrackingLostEvent(
+                    member_id=member_id, station_id=self.station_id,
+                    consecutive_missed_frames=missed, timestamp=now,
+                )
+            )
+        return events
 
     def request_wristband_placement_change(
         self, wristband_id: str, to_side: BandSide, at_time: Optional[float] = None,
@@ -387,6 +440,7 @@ class StationSessionRunner:
                 session = self._sessions.get(wristband_id)
                 if session is not None:
                     person = people[0] if people else None
+                    self._on_events(self._track_tracking_loss(wristband_id, person is not None, now))
                     self._on_events(session.process_frame(frame, now, person))
             return
 

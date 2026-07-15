@@ -231,3 +231,85 @@ def test_two_members_at_two_different_stations_simultaneously():
     assert all(e.member_id == "member-bob" for e in rep_events_2)
     assert len(rep_events_1) >= 1
     assert len(rep_events_2) >= 1
+
+
+def test_workout_state_reaches_exercise_confirmed_when_a_band_first_appears():
+    """Priority 6: GymSessionRunner is the correct scope for a
+    wristband's whole-visit WorkoutStateMachine (see irix.pipeline.
+    workout_state's and irix.live.gym_runner's module docstrings for
+    why not StationSessionRunner) -- BLE presence + a successful
+    CheckoutRegistry.resolve_member already is confident identity
+    resolution for the common single-candidate case, and each station
+    has exactly one fixed exercise, so a first-ever appearance should
+    drive straight through to EXERCISE_CONFIRMED with no ambiguity."""
+    from irix.pipeline.workout_state import WorkoutPhase
+
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    station_events, gym_events = {}, []
+    n_ticks = 5
+    script = [[
+        BLEReading(station_id="squat-1", rssi=-40.0, timestamp=float(t), wristband_id="band-1"),
+    ] for t in range(n_ticks)]
+    runner = _build_runner(n_ticks, script, registry, station_events, gym_events, min_consecutive=1)
+    runner.run_forever(max_frames=n_ticks)
+
+    machine = runner._workout_states["band-1"]
+    assert machine.phase == WorkoutPhase.EXERCISE_CONFIRMED
+    assert machine.current_station_id == "squat-1"
+    assert machine.health.camera_connected is True
+
+
+def test_workout_state_survives_a_cross_station_handoff():
+    from irix.pipeline.workout_state import WorkoutPhase
+
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    station_events, gym_events = {}, []
+    n_ticks = 30
+    ble_script = _walk_script(n_ticks, switch_at=15)
+    runner = _build_runner(n_ticks, ble_script, registry, station_events, gym_events)
+    runner.run_forever(max_frames=n_ticks)
+    runner.close()
+
+    assert len(gym_events) == 1  # the handoff itself, already covered above
+    machine = runner._workout_states["band-1"]
+    assert machine.current_station_id == "squat-2"
+    assert machine.phase == WorkoutPhase.EXERCISE_CONFIRMED  # re-confirmed at the new station
+    # The transition happened through MEMBER_DETECTED, not by silently
+    # skipping straight from squat-1's confirmed state to squat-2's.
+    assert WorkoutPhase.MEMBER_DETECTED in machine.history
+
+
+def test_close_stale_sessions_ends_the_workout_after_presence_timeout():
+    from irix.pipeline.workout_state import WorkoutPhase
+
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    station_events, gym_events = {}, []
+    n_ticks = 10
+    # Present for the first few ticks, then goes quiet -- clock steps
+    # 0.5s/tick and presence_timeout_s defaults to 1.0s in _build_runner.
+    present = [BLEReading(station_id="squat-1", rssi=-40.0, timestamp=0.0, wristband_id="band-1")]
+    script = [present] * 3 + [[]] * 7
+    runner = _build_runner(n_ticks, script, registry, station_events, gym_events, min_consecutive=1)
+    runner.run_forever(max_frames=n_ticks)
+
+    machine = runner._workout_states["band-1"]
+    assert machine.phase == WorkoutPhase.SESSION_ENDED
+
+
+def test_record_wristband_returned_ends_the_session_and_forgets_it():
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    station_events, gym_events = {}, []
+    n_ticks = 3
+    present = [BLEReading(station_id="squat-1", rssi=-40.0, timestamp=0.0, wristband_id="band-1")]
+    script = [present] * n_ticks
+    runner = _build_runner(n_ticks, script, registry, station_events, gym_events, min_consecutive=1)
+    runner.run_forever(max_frames=n_ticks)
+
+    assert runner.record_wristband_returned("band-1") is True
+    assert "band-1" not in runner._workout_states
+    # Returning a band with no tracked session at all is a no-op, not an error.
+    assert runner.record_wristband_returned("band-nonexistent") is False

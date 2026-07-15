@@ -92,6 +92,16 @@ completed this phase removed, new gaps this phase's work surfaced added.
       `identity_degraded` states exist to consume it -- built in that
       order deliberately (a resolution with nowhere to go is just an
       unused data class).
+- [ ] **Wire per-station rep/set events into the gym-wide
+      `WorkoutStateMachine`.** `irix.live.gym_runner.GymSessionRunner`
+      now drives session/identity/station-transition/health phases
+      correctly (Phase 3), but `SET_STARTED`/`record_rep_completed`/
+      `SET_ENDED`/`REST_STARTED`/`REST_ENDED` are not yet triggered from
+      real `RepSession` events -- each `StationSessionRunner`'s
+      `on_events` callback would need to also forward
+      `RepCompletedEvent`/`SetCompleteEvent` up to `GymSessionRunner`
+      (which already owns the right `WorkoutStateMachine` instance per
+      wristband_id) rather than only to that station's own event sink.
 - [ ] **"Motion onset" as its own identity-fusion signal.** Named
       explicitly in the founding brief's identity-fusion signal list
       (alongside camera trajectory/IMU motion/timing/clock sync/station
@@ -115,11 +125,25 @@ completed this phase removed, new gaps this phase's work surfaced added.
       `irix.benchmark.benchmark_pose_inference`/`_gpu_available` already
       auto-detect and run for real the moment they're installed; nothing
       else to build, just needs to actually run on target hardware.
-- [ ] **Scope and add missing event types** (`ExerciseDetected`/
-      `RestStarted`/`RestEnded`/`TrackingLost`/`TrackingRecovered`,
-      still open -- see `docs/API_SPEC.md`). `ExerciseDetected` now has
-      a natural source (`irix.exercise_recognition`) once the session-
-      start wiring above exists.
+- [x] ~~Scope and add missing event types~~ -- done: `TrackingLostEvent`/
+      `TrackingRecoveredEvent`/`RestStartedEvent`/`RestEndedEvent`/
+      `ExerciseDetectedEvent` all exist now (`irix/pipeline/schema.py`,
+      `docs/API_SPEC.md`). Emission wired for `TrackingLost`/
+      `TrackingRecovered` in `StationSessionRunner`'s single-candidate
+      path only (a consecutive-missed-frame streak) -- **not yet** for
+      the crowded-station path (`irix.live.disambiguation.
+      CrowdedGroupDisambiguator` returning nothing for a slot while
+      buffering looks the same as "actually lost track" from
+      `StationSessionRunner`'s side today; needs its own signal to tell
+      the two apart before wiring tracking-loss there too).
+      `RestStartedEvent`/`RestEndedEvent` are **not yet emitted by
+      anything** -- need a live timer comparing "now" against the last
+      completed rep's timestamp *between* ticks (the existing
+      `RestGapSetBoundaryDetector` only infers a gap retroactively, at
+      the next rep -- correct for its own batch/replay job, wrong shape
+      for a real-time "resting right now" event). `ExerciseDetectedEvent`
+      is **not yet emitted by anything** -- still needs the session-start
+      wiring described in this file's first bullet.
 
 ## Medium priority
 

@@ -330,7 +330,141 @@ class SetFatigueSummaryEvent:
         }
 
 
+@dataclass
+class TrackingLostEvent:
+    """A station's pose estimator stopped detecting anyone for this
+    member for enough consecutive frames to be a real tracking loss, not
+    a single missed detection (irix.live.station_runner.
+    StationSessionRunner -- see that module's tracking-loss guard).
+    Distinct from a camera disconnect (irix.live.camera_source.
+    ReconnectingFrameSource, which is frames not arriving at all) --
+    this is frames arriving but nobody being detected in them
+    (occlusion, member stepped just out of frame, detector miss)."""
+
+    member_id: str
+    station_id: str
+    consecutive_missed_frames: int
+    timestamp: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": "tracking_lost",
+            "member_id": self.member_id,
+            "station_id": self.station_id,
+            "consecutive_missed_frames": self.consecutive_missed_frames,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class TrackingRecoveredEvent:
+    """The member was detected again after a TrackingLostEvent -- always
+    paired with exactly one prior TrackingLostEvent for the same
+    member_id/station_id (irix.live.station_runner.StationSessionRunner
+    tracks this, never emits one without the other)."""
+
+    member_id: str
+    station_id: str
+    gap_duration_s: float
+    timestamp: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": "tracking_recovered",
+            "member_id": self.member_id,
+            "station_id": self.station_id,
+            "gap_duration_s": self.gap_duration_s,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class RestStartedEvent:
+    """No rep has been detected for this member/exercise for long enough
+    to consider them resting rather than mid-set (Section 5.6's
+    ``rest_started`` workout state). **Not yet emitted by anything** --
+    the existing rest-boundary detector (``irix.pipeline.events.
+    RestGapSetBoundaryDetector``) infers a gap only retroactively, once
+    the *next* rep arrives, which is exactly right for closing a
+    finished set in a batch/replay context (``irix.demo.run_upload``)
+    but can't produce a real-time "resting right now" event on its own
+    -- that needs a live timer comparing "now" against the last rep's
+    timestamp between reps, not just at the next one. See
+    ``docs/TODO.md``."""
+
+    member_id: str
+    station_id: str
+    exercise: str
+    timestamp: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": "rest_started",
+            "member_id": self.member_id,
+            "station_id": self.station_id,
+            "exercise": self.exercise,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class RestEndedEvent:
+    """The member started a new set after a ``RestStartedEvent`` --
+    ``rest_duration_s`` is the corroborating measurement
+    ``SetFatigueSummaryEvent``'s ``set_to_set_velocity_trend_pct`` is
+    interpreted alongside (fatigue analysis already treats rest duration
+    as relevant context; this is that duration made an explicit,
+    directly-observable event rather than only inferable after the
+    fact). **Not yet emitted by anything** -- same live-timer gap as
+    ``RestStartedEvent`` above."""
+
+    member_id: str
+    station_id: str
+    exercise: str
+    rest_duration_s: float
+    timestamp: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": "rest_ended",
+            "member_id": self.member_id,
+            "station_id": self.station_id,
+            "exercise": self.exercise,
+            "rest_duration_s": self.rest_duration_s,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class ExerciseDetectedEvent:
+    """``irix.exercise_recognition.recognize_exercise`` confirmed which
+    exercise a member is performing (Section 5.6's
+    ``exercise_candidate``/``exercise_confirmed`` workout states).
+    **Not yet emitted by anything** -- ``recognize_exercise`` exists and
+    is tested in isolation but isn't wired into any session-start
+    decision path yet; every current session still trusts
+    ``StationInfo.default_exercise`` unconditionally. See
+    ``docs/TODO.md``."""
+
+    member_id: str
+    station_id: str
+    exercise: str
+    confidence: float
+    timestamp: float = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": "exercise_detected",
+            "member_id": self.member_id,
+            "station_id": self.station_id,
+            "exercise": self.exercise,
+            "confidence": self.confidence,
+            "timestamp": self.timestamp,
+        }
+
+
 CameraEvent = Union[
-    RepCompletedEvent, SetCompleteEvent, BandPlacementRequiredEvent, WeightConfirmedEvent,
-    StationHandoffEvent, SetFatigueSummaryEvent,
+    RepCompletedEvent, SetCompleteEvent, BandPlacementRequiredEvent, BandPlacementConfirmedEvent,
+    WeightConfirmedEvent, StationHandoffEvent, SetFatigueSummaryEvent,
+    TrackingLostEvent, TrackingRecoveredEvent, RestStartedEvent, RestEndedEvent, ExerciseDetectedEvent,
 ]

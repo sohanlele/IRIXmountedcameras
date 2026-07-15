@@ -41,6 +41,7 @@ from typing import Callable, Dict, List, Optional
 from ..identity.ble_pairing import BLEReading
 from ..identity.checkout import CheckoutRegistry
 from ..pipeline.schema import CameraEvent
+from ..pipeline.workout_state import WorkoutPhase, WorkoutStateMachine
 from ..topology.handoff import GymCoordinator
 from ..topology.registry import StationRegistry
 from .station_runner import StationSessionRunner
@@ -94,6 +95,53 @@ class GymSessionRunner:
 
         self._last_seen_ts: Dict[str, float] = {}  # member_id -> last tick any reading for their band appeared
         self._band_for_member: Dict[str, str] = {}  # member_id -> wristband_id (reverse of checkout, cached per-tick)
+        # One WorkoutStateMachine per wristband for its whole gym visit
+        # (Priority 6) -- this is the correct scope for session-level
+        # phases (SESSION_STARTED...SESSION_ENDED) and cross-station
+        # transitions specifically because this class, not any one
+        # StationSessionRunner, is the thing that already knows when a
+        # band first appears gym-wide and when GymCoordinator resolves an
+        # actual cross-station handoff -- see the module docstring and
+        # irix.pipeline.workout_state's own docstring for why a
+        # per-station instance would have gotten this scope wrong.
+        self._workout_states: Dict[str, WorkoutStateMachine] = {}
+
+    def _workout_state_for(self, wristband_id: str) -> WorkoutStateMachine:
+        """The wristband's WorkoutStateMachine, creating and driving a
+        fresh one through WRISTBAND_ASSIGNED -> ... -> IDENTITY_CONFIRMED
+        the first time this band is ever seen this visit -- BLE presence
+        plus a successful ``CheckoutRegistry.resolve_member`` *is*
+        confident identity resolution for the common single-candidate
+        case (matches ``irix.identity.resolution.from_sole_candidate``'s
+        same reasoning); the crowded-station case still resolves a
+        specific detected *person* to this already-identity-confirmed
+        member separately, one level down, in ``StationSessionRunner``."""
+        machine = self._workout_states.get(wristband_id)
+        if machine is not None:
+            return machine
+        machine = WorkoutStateMachine(wristband_id=wristband_id)
+        machine.transition(WorkoutPhase.SESSION_STARTED)
+        machine.transition(WorkoutPhase.MEMBER_DETECTED)
+        machine.transition(WorkoutPhase.IDENTITY_CANDIDATE)
+        machine.transition(WorkoutPhase.IDENTITY_CONFIRMED)
+        self._workout_states[wristband_id] = machine
+        return machine
+
+    def _advance_workout_state_to_station(self, machine: WorkoutStateMachine, station_id: str) -> None:
+        """Re-confirm identity and the (single, station-fixed) exercise
+        for wherever this band is now authoritative -- called both for a
+        brand-new session's first station and for every later
+        cross-station handoff."""
+        if machine.current_station_id != station_id:
+            machine.record_station_transition(station_id)
+        if machine.phase == WorkoutPhase.MEMBER_DETECTED:
+            machine.transition(WorkoutPhase.IDENTITY_CANDIDATE)
+            machine.transition(WorkoutPhase.IDENTITY_CONFIRMED)
+        if machine.phase == WorkoutPhase.IDENTITY_CONFIRMED:
+            runner = self.station_runners.get(station_id)
+            if runner is not None:
+                machine.transition(WorkoutPhase.EXERCISE_CANDIDATE)
+                machine.transition(WorkoutPhase.EXERCISE_CONFIRMED)
 
     def _update_gym_wide_presence(self, readings: List[BLEReading], now: float) -> None:
         by_band: Dict[str, List[BLEReading]] = {}
@@ -105,11 +153,60 @@ class GymSessionRunner:
             if not self.checkout_registry.is_checked_out(wristband_id):
                 continue  # a band nobody currently has checked out is never tracked
             member_id = self.checkout_registry.resolve_member(wristband_id)
+            machine = self._workout_state_for(wristband_id)
             handoff_event = self.coordinator.update_member(member_id, band_readings, timestamp=now)
             if handoff_event is not None:
                 self._on_gym_events([handoff_event])
+            current_station = self.coordinator.current_station(member_id)
+            if current_station is not None:
+                self._advance_workout_state_to_station(machine, current_station)
             self._last_seen_ts[member_id] = now
             self._band_for_member[member_id] = wristband_id
+
+    def record_wristband_returned(self, wristband_id: str, at_time: Optional[float] = None) -> bool:
+        """Backend entry point for the actual physical wristband-return
+        event (e.g. a caller's front-desk check-in flow, after calling
+        ``CheckoutRegistry.check_in`` -- this class doesn't hook that
+        registry call automatically, since a member returning a band and
+        this system's gym-wide presence timeout are two different real-
+        world signals that shouldn't be conflated; see ``close_stale_
+        sessions``' docstring for the timeout side). Advances straight to
+        ``SESSION_ENDED`` first if the band's session hadn't already been
+        ended by a presence timeout. Returns whether a tracked session
+        for this band existed at all."""
+        machine = self._workout_states.get(wristband_id)
+        if machine is None:
+            return False
+        if machine.phase not in (WorkoutPhase.SESSION_ENDED, WorkoutPhase.WRISTBAND_RETURNED):
+            if machine.phase in (WorkoutPhase.SET_STARTED,):
+                machine.transition(WorkoutPhase.SET_ENDED)
+            machine.transition(WorkoutPhase.SESSION_ENDED)
+        if machine.phase != WorkoutPhase.WRISTBAND_RETURNED:
+            machine.transition(WorkoutPhase.WRISTBAND_RETURNED)
+        del self._workout_states[wristband_id]
+        return True
+
+    def close_stale_sessions(self, now: Optional[float] = None) -> None:
+        """A band that hasn't produced any BLE reading anywhere for
+        ``presence_timeout_s`` is considered to have ended its *workout*
+        (``WorkoutStateMachine.force_end_session`` -- see that method's
+        docstring for why this is a bypass, not a validated transition)
+        -- deliberately not the same event as ``record_wristband_
+        returned``: a member who sets their phone/band down for a few
+        minutes mid-session hasn't returned it to the front desk. Call
+        this once per gym-wide tick (``run_forever`` does) or on
+        whatever cadence a caller drives ticks at directly."""
+        now = now if now is not None else self._clock()
+        for member_id, last_seen in list(self._last_seen_ts.items()):
+            if now - last_seen < self.presence_timeout_s:
+                continue
+            wristband_id = self._band_for_member.get(member_id)
+            if wristband_id is None:
+                continue
+            machine = self._workout_states.get(wristband_id)
+            if machine is None:
+                continue
+            machine.force_end_session()
 
     def _present_wristbands_at(self, station_id: str, now: float) -> List[str]:
         """Every band currently authoritative at ``station_id``, per
@@ -159,6 +256,7 @@ class GymSessionRunner:
 
             now = self._clock()
             self._update_gym_wide_presence(self.ble_reader(), now)
+            self.close_stale_sessions(now)
 
             for station_id, frame in frames.items():
                 present_wristband_ids = self._present_wristbands_at(station_id, now)

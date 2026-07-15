@@ -1498,3 +1498,114 @@ deep-ReID tracking upgrade (unnecessary at this scale, see
 `irix/pose/tracker.py`); no Docker/Jetson deployment work (explicitly
 out of scope for this phase per the founding brief -- "the objective is
 no longer to improve infrastructure").
+
+## Phase 3: production pipeline integration (2026-07-14, in progress)
+
+Phase 2 built and unit-tested individual accuracy modules in isolation.
+Phase 3's objective is different: stop adding isolated modules and
+integrate everything into the one production pipeline every live/replay/
+demo entry point actually runs, so accuracy improvements are default
+behavior, not opt-in extras nobody's wiring up sees.
+
+**Default production wiring** (`irix.live.station_runner.
+StationSessionRunner`, `irix.pipeline.rep_session.RepSession`):
+`_ensure_estimator()` now wraps a real default `PoseEstimator` in
+`irix.pose.tracker.TrackedPoseEstimator` (persistent track_id) unless a
+caller injects its own (every test/demo unaffected); one
+`irix.fusion.clock_sync.ClockSyncEstimator` per open session applies its
+current correction to every `add_imu_samples` call (an explicit
+calibration step, `calibrate_wristband_clock`, is the real entry point --
+see below for why this repo does *not* auto-derive observations from
+per-set rep timestamps); `irix.pose.calibration.CalibrationProfile.
+undistort_frame` runs before pose estimation when a station's calibration
+is configured; `irix.weight_recognition.plate_color_check` runs on every
+weight check regardless of VLM configuration (`method="color_plate"`
+when no VLM backend exists, `"vlm"` cross-checked against it otherwise).
+
+**A real mistake, caught by its own tests, and reverted**: the first
+attempt at closing `docs/TODO.md`'s "wire `ClockSyncEstimator` into a
+live entry point" gap tried auto-deriving clock-offset observations by
+pairing each set's camera-detected rep-completion timestamps against
+`RepCountFusion`'s IMU-derived peak timestamps
+(`estimate_offset_from_paired_events`, new this phase). Development
+tests (`tests/test_rep_session_clock_sync.py`) caught that this
+systematically produces a *wrong* offset, not just a noisy one: a
+camera's rep-completion timestamp and an IMU counter's acceleration-peak
+timestamp mark different phases of one physical rep (top-of-lift vs.
+peak concentric acceleration), so the pairing conflates a fixed phase
+offset with genuine clock drift. This was reverted -- `RepSession` no
+longer auto-populates observations at all; `estimate_offset_from_paired_
+events` is kept as a general utility (correct for genuinely comparable
+event pairs) with an explicit warning against this exact misuse. Worth
+recording here rather than just in a commit message: this is the kind of
+mistake "unknown over incorrect" is meant to catch, and it worked.
+
+**Wristband placement state machine** (`irix.identity.placement.
+WristbandPlacementTracker`, Priority 4): a real-time `STABLE -> SETTLING
+-> CALIBRATING -> STABLE` state machine for a band's actual worn side
+(`BandSide`: `left_wrist`/`right_wrist`/`left_ankle`/`right_ankle`/
+`unknown`) -- distinct from `ExerciseConfig.band_placement`'s static
+wrist-vs-ankle *requirement*. Fastening-motion samples are discarded by
+a sliding settle window; once genuinely quiet and gravity-consistent
+(magnitude check, not just low variance -- rules out e.g. free-fall
+"quiet" readings), the settled window's own data estimates which local
+axis is "up" (rather than assuming a fixed convention, which would be
+wrong across different physical orientations) and
+`irix.wristband_sim.calibration.calibrate_stationary` recalibrates for
+the new placement. `RepSession` withholds IMU samples from fusion
+entirely while paused (mid-change) or while the confirmed side's limb
+type doesn't match the exercise's requirement -- "never reuse wrist
+thresholds for ankle data or vice versa" made concrete, not just stated.
+Also corrected a real bug surfaced while wiring this: `HACK_SQUAT` was
+configured `ANKLE`, which contradicts the founding brief's explicit
+per-exercise placement guidance (camera-primary, wrist-band, like
+`SQUAT`) -- fixed, and the seven exercises that guidance names but
+didn't exist yet (`LUNGE`, `BULGARIAN_SPLIT_SQUAT`, `CALF_RAISE`,
+`LEG_EXTENSION`, `LEG_CURL`, `HIP_ABDUCTION`, `HIP_ADDUCTION`) were added.
+
+**Identity association fusion** (Priority 5): `StationSessionRunner.tick`
+now feeds `irix.live.disambiguation.CrowdedGroupDisambiguator`
+clock-synchronized IMU (not raw) and withholds a band's samples while
+its placement tracker reports mid-change (fastening motion is not the
+wearer's body-motion signal). `irix.identity.motion_correlation.
+MotionCorrelationResolver` gained a `prior_slot_assignment` continuity
+hint -- a small ranking bonus toward whichever member correlated to a
+detected-person slot last window, enough to break a genuine near-tie
+without overruling a clearly different result; `CrowdedGroupDisambiguator`
+remembers its last resolved assignment across group changes/resets and
+threads it through. New `irix.identity.resolution.IdentityResolution`
+(member_id + confidence + ambiguous + evidence) consolidates which of
+the founding brief's named identity-fusion signals already have a real
+source in this repo (documented in that module's docstring) vs. what's
+still a real gap (motion onset as its own distinct signal; wiring
+`IdentityResolution` into the live path itself, deliberately deferred
+until the workout state machine below exists to consume it).
+
+**Workout state machine** (`irix.pipeline.workout_state.
+WorkoutStateMachine`, Priority 6): models the founding brief's 19 named
+states as one ordered `WorkoutPhase` lifecycle plus independent
+`WorkoutHealth` flags (see that module's docstring for why a single flat
+state enum would have been the wrong model -- some states repeat many
+times within another, some are conditions rather than steps). Enforces
+by construction: no duplicate sessions, no late packets reopening a
+completed set, no duplicate reps, a mechanism for preventing
+camera-overlap double counting. Owned by `irix.live.gym_runner.
+GymSessionRunner`, deliberately not any single `StationSessionRunner` --
+a station only ever sees one slice of a member's gym-wide visit, and
+`GymSessionRunner` is already the layer that knows when a band first
+appears gym-wide and when a real cross-station handoff happens (see both
+modules' docstrings). Five new event types
+(`TrackingLostEvent`/`TrackingRecoveredEvent`/`RestStartedEvent`/
+`RestEndedEvent`/`ExerciseDetectedEvent`) close `docs/TODO.md`'s
+previously-open "scope and add missing event types" item; only the
+tracking-loss pair is wired to a real emission source so far (a
+consecutive-missed-frame streak in `StationSessionRunner`'s
+single-candidate path) -- see `docs/TODO.md` for what's left.
+
+**What's still open going into the rest of Phase 3**: unifying load
+detection into one authoritative status/evidence shape (Priority 7),
+session-recording/data-collection tooling (Priority 8), identity/event
+latency benchmarks (Priority 9), an external per-gym configuration system
+(Priority 10), the IRIX Studio backend interface (Priority 11), expanded
+multi-condition validation reporting (Priority 12). Tracked in
+`docs/TODO.md` and the session's own task list, in that priority order.
