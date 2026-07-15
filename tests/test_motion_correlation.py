@@ -143,3 +143,57 @@ def test_single_candidate_single_person_matches_if_confident_enough():
     # discriminated against any alternative, not just default to "sure".
     assert results[0] is not None
     assert results[0].member_id == "alice"
+
+
+def test_prior_slot_assignment_breaks_an_otherwise_too_close_to_call_tie():
+    """Priority 5's "fuse ... previous confirmed identity" requirement:
+    when two candidates correlate almost equally well with a detected
+    person (a genuine near-tie, unresolvable on this window's motion
+    evidence alone), a prior_slot_assignment hint should be enough to
+    break the tie toward whichever member was already confirmed in that
+    slot last window -- but only as a tie-breaker, not a way to overrule
+    a clearly different result (see the next test)."""
+    # Both candidates fed the exact same underlying IMU signal (same
+    # freq/phase/seed) -- raw correlation against the detected person is
+    # therefore exactly tied, a genuine, unresolvable-on-evidence-alone
+    # ambiguity, not just a numerically-close approximation of one.
+    poses = _make_poses(freq=0.4, phase=0.0, seed=1, noise=3.0)
+    imu_alice = _make_imu(freq=0.4, phase=0.0, seed=10, noise=2.0)
+    imu_bob = _make_imu(freq=0.4, phase=0.0, seed=10, noise=2.0)
+
+    resolver = MotionCorrelationResolver(min_confidence_margin=0.1, prior_identity_bonus=0.2)
+
+    baseline = resolver.resolve(
+        candidate_imu_streams={"alice": imu_alice, "bob": imu_bob},
+        detected_people_poses=[poses],
+        pose_fps=30.0,
+    )
+    assert baseline[0] is None  # too close to call without a prior
+
+    with_prior = resolver.resolve(
+        candidate_imu_streams={"alice": imu_alice, "bob": imu_bob},
+        detected_people_poses=[poses],
+        pose_fps=30.0,
+        prior_slot_assignment={0: "bob"},
+    )
+    assert with_prior[0] is not None
+    assert with_prior[0].member_id == "bob"
+    # The bonus affects ranking/margin only -- reported confidence/
+    # correlation should still reflect genuine (un-inflated) evidence.
+    assert with_prior[0].correlation <= 1.0
+
+
+def test_prior_slot_assignment_does_not_overrule_a_clear_result():
+    poses_a = _make_poses(freq=0.5, phase=0.0, seed=1)
+    imu_alice = _make_imu(freq=0.5, phase=0.0, seed=3)
+    imu_bob = _make_imu(freq=0.15, phase=2.5, seed=4)
+
+    resolver = MotionCorrelationResolver(prior_identity_bonus=0.2)
+    results = resolver.resolve(
+        candidate_imu_streams={"alice": imu_alice, "bob": imu_bob},
+        detected_people_poses=[poses_a],
+        pose_fps=30.0,
+        prior_slot_assignment={0: "bob"},  # contradicts the clear evidence for alice
+    )
+    assert results[0] is not None
+    assert results[0].member_id == "alice"

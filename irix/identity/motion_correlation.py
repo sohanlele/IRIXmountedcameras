@@ -168,15 +168,31 @@ class MotionCorrelationResolver:
     more than one camera-detected person.
     """
 
-    def __init__(self, keypoint_name: str = "left_wrist", min_confidence_margin: float = 0.15):
+    def __init__(
+        self,
+        keypoint_name: str = "left_wrist",
+        min_confidence_margin: float = 0.15,
+        prior_identity_bonus: float = 0.1,
+    ):
         self.keypoint_name = keypoint_name
         self.min_confidence_margin = min_confidence_margin
+        # Priority 5's "fuse ... previous confirmed identity" requirement:
+        # a person_index slot that correlated to a given member last
+        # window gets a small correlation-score bonus toward that same
+        # member this window -- enough to break an otherwise-close tie in
+        # favor of continuity (reduces identity flicker across
+        # consecutive short buffering windows for the same, unchanged
+        # pair of people), not enough to overrule a clearly different
+        # correlation result (this only ever affects which candidate a
+        # slot is compared against, never bypasses min_confidence_margin).
+        self.prior_identity_bonus = prior_identity_bonus
 
     def resolve(
         self,
         candidate_imu_streams: Dict[str, List[IMUSample]],
         detected_people_poses: List[List[PersonPose]],
         pose_fps: float,
+        prior_slot_assignment: Optional[Dict[int, str]] = None,
     ) -> List[Optional[MotionCorrelationMatch]]:
         """One result per entry in ``detected_people_poses``, in order.
         ``None`` for a detected person whose best- and second-best-
@@ -190,6 +206,13 @@ class MotionCorrelationResolver:
         from consideration for the rest (a simple greedy assignment;
         exact bipartite matching is unnecessary at the 2-3 candidate
         scale this is meant for).
+
+        ``prior_slot_assignment``: the previous window's resolved
+        ``{person_index: member_id}`` for this same detection source, if
+        any (``irix.live.disambiguation.CrowdedGroupDisambiguator`` keeps
+        this across re-resolutions) -- see ``prior_identity_bonus``
+        above. ``None``/omitted disables this entirely, e.g. for a
+        first-ever resolution with no prior to lean on.
         """
         dt = 1.0 / pose_fps
         vision_signals = [
@@ -203,22 +226,29 @@ class MotionCorrelationResolver:
         # tie doesn't starve a later, more confident pairing of its best
         # candidate.
         scored: List[Tuple[float, int, str, float]] = []  # (confidence, person_idx, member_id, correlation)
+        prior_slot_assignment = prior_slot_assignment or {}
         for person_idx, vsig in enumerate(vision_signals):
             corrs = []
             for member_id, az in imu_signals.items():
                 if len(az) < 2 or len(vsig) < 2:
-                    corrs.append((member_id, 0.0))
+                    corrs.append((member_id, 0.0, 0.0))
                     continue
                 resampled = np.interp(np.linspace(0, 1, len(vsig)), np.linspace(0, 1, len(az)), az)
-                corrs.append((member_id, _normalized_cross_correlation(vsig, resampled)))
-            corrs.sort(key=lambda c: -c[1])
+                raw_corr = _normalized_cross_correlation(vsig, resampled)
+                bonus = self.prior_identity_bonus if prior_slot_assignment.get(person_idx) == member_id else 0.0
+                corrs.append((member_id, raw_corr, min(1.0, raw_corr + bonus)))
+            # Rank by the (possibly prior-boosted) score, but report the
+            # *raw* correlation in the result -- the bonus should be able
+            # to break a close tie in favor of continuity, not inflate
+            # the evidence a caller sees for why this pairing was chosen.
+            corrs.sort(key=lambda c: -c[2])
             if not corrs:
                 continue
-            best_member, best_corr = corrs[0]
-            second_corr = corrs[1][1] if len(corrs) > 1 else 0.0
-            margin = best_corr - max(second_corr, 0.0)
+            best_member, best_raw_corr, best_ranked = corrs[0]
+            second_ranked = corrs[1][2] if len(corrs) > 1 else 0.0
+            margin = best_ranked - max(second_ranked, 0.0)
             confidence = min(1.0, margin * 2)
-            scored.append((confidence, person_idx, best_member, best_corr))
+            scored.append((confidence, person_idx, best_member, best_raw_corr))
 
         scored.sort(key=lambda s: -s[0])
         results: List[Optional[MotionCorrelationMatch]] = [None] * len(detected_people_poses)

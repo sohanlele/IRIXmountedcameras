@@ -78,6 +78,18 @@ class CrowdedGroupDisambiguator:
         self._slot_assignment: Dict[int, str] = {}
         self._buffer_started_at: Optional[float] = None
         self._buffer_span_s: float = 0.0
+        # Last successfully-resolved {person_index: wristband_id} from
+        # *any* prior resolution on this source, kept across a group
+        # change (unlike everything else reset above) -- fed to the next
+        # resolve() as a continuity prior (Priority 5's "previous
+        # confirmed identity" fusion input). Deliberately not cleared by
+        # reset()/a group change: a still-image-worth of the same people
+        # standing in the same relative positions is exactly the case
+        # this is meant to stabilize, and reset()/group-change already
+        # happen often (any single-candidate tick resets the buffer, see
+        # StationSessionRunner.tick) -- discarding this on every one of
+        # those would make it useless.
+        self._last_slot_assignment: Dict[int, str] = {}
 
     @property
     def slot_assignment(self) -> Dict[int, str]:
@@ -168,10 +180,21 @@ class CrowdedGroupDisambiguator:
         # necessarily land at a perfectly uniform interval.
         pose_fps = float(elapsed_ticks) / self._buffer_span_s if self._buffer_span_s > 0 else 30.0
 
+        # Translate the last resolution's {slot: wristband_id} into
+        # {slot: member_id} for the resolver's own member_id-keyed prior
+        # -- irix.identity.motion_correlation.MotionCorrelationResolver
+        # doesn't know about wristband ids at all, only member ids.
+        prior_slot_assignment = {
+            slot: member_id
+            for slot, wid in self._last_slot_assignment.items()
+            for member_id, candidate_wid in wristband_by_member.items()
+            if candidate_wid == wid
+        }
         results = self._motion_resolver.resolve(
             candidate_imu_streams=candidate_imu_streams,
             detected_people_poses=_transpose_pose_buffer(self._pose_buffer, n_slots),
             pose_fps=pose_fps,
+            prior_slot_assignment=prior_slot_assignment,
         )
         self._slot_assignment = {}
         for match in results:
@@ -180,6 +203,8 @@ class CrowdedGroupDisambiguator:
             wristband_id = wristband_by_member.get(match.member_id)
             if wristband_id is not None:
                 self._slot_assignment[match.person_index] = wristband_id
+        if self._slot_assignment:
+            self._last_slot_assignment = dict(self._slot_assignment)
 
         # Start a fresh buffer regardless of whether every slot resolved
         # -- an unmatched slot gets another window to try again rather

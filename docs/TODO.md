@@ -80,6 +80,27 @@ completed this phase removed, new gaps this phase's work surfaced added.
       correlation` against camera-tracked wrist-keypoint vertical
       velocity and raw wristband vertical accel is the identified next
       step, not yet built.
+- [ ] **`IdentityResolution` not yet wired into `StationSessionRunner`'s
+      trivial (sole-candidate) path.** `irix.identity.resolution` (Phase
+      3) exists and is used by nothing yet -- `CrowdedGroupDisambiguator`
+      still returns bare `{wristband_id: PersonPose}` and
+      `StationSessionRunner.tick`'s single-candidate branch still uses
+      the sole present wristband's member_id directly, neither
+      constructing an `IdentityResolution`. Natural next step: wire both
+      paths through it, and surface it as a real event once the Priority
+      6 workout state machine's `identity_candidate`/`identity_confirmed`/
+      `identity_degraded` states exist to consume it -- built in that
+      order deliberately (a resolution with nowhere to go is just an
+      unused data class).
+- [ ] **"Motion onset" as its own identity-fusion signal.** Named
+      explicitly in the founding brief's identity-fusion signal list
+      (alongside camera trajectory/IMU motion/timing/clock sync/station
+      occupancy/camera zones/previous confirmed identity/BLE context,
+      all of which already have a real source -- see `irix.identity.
+      resolution`'s module docstring) but not yet its own distinct
+      input anywhere: a just-arrived member's first detected movement as
+      a corroborating signal, distinct from `irix.identity.
+      motion_correlation`'s steady-state periodic correlation.
 - [ ] **Add `schema_version` to the `CameraEvent` family** (still open --
       see `docs/API_SPEC.md`).
 - [ ] **Barbell/plate object detector** (`FreeWeightDetector`, still an

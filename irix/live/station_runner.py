@@ -77,7 +77,7 @@ import time
 from typing import Callable, Dict, List, Optional
 
 from ..barbell.detector import FreeWeightDetector
-from ..fusion.clock_sync import ClockSyncEstimator
+from ..fusion.clock_sync import ClockSyncEstimator, apply_clock_sync
 from ..fusion.imu import IMUSample
 from ..fusion.imu_stream import IMUStream
 from ..identity.ble_pairing import BLEReading
@@ -390,8 +390,31 @@ class StationSessionRunner:
                     self._on_events(session.process_frame(frame, now, person))
             return
 
+        # Identity/motion-correlation disambiguation (irix.identity.
+        # motion_correlation) needs clock-synchronized, genuinely-body-
+        # motion IMU samples to correlate meaningfully against camera
+        # keypoint motion -- Priority 5's "fuse ... clock synchronization"
+        # requirement made concrete: apply each band's current best clock
+        # offset (same correction RepSession.add_imu_samples applies for
+        # fusion) before handing samples to the disambiguator, and
+        # withhold a band's samples entirely while its placement tracker
+        # reports mid-change (fastening/carrying motion is not this
+        # member's body motion signal -- see irix.identity.placement).
+        synced_polled: Dict[str, List[IMUSample]] = {}
+        for wristband_id, samples in polled.items():
+            tracker = self._placement_trackers.get(wristband_id)
+            if tracker is not None and tracker.paused:
+                synced_polled[wristband_id] = []
+                continue
+            estimator = self._clock_sync_estimators.get(wristband_id)
+            if estimator is not None and samples:
+                sync_estimate = estimator.estimate()
+                if sync_estimate.n_observations > 0:
+                    samples = apply_clock_sync(samples, sync_estimate)
+            synced_polled[wristband_id] = samples
+
         routed = self._disambiguator.route(
-            now, frozenset(present_set), people, polled, self.checkout_registry.resolve_member,
+            now, frozenset(present_set), people, synced_polled, self.checkout_registry.resolve_member,
         )
         for wristband_id, pose in routed.items():
             session = self._sessions.get(wristband_id)

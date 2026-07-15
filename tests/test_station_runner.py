@@ -564,3 +564,65 @@ def test_request_wristband_placement_change_for_unopened_band_is_a_no_op():
         clock=_FakeClock(step=0.1),
     )
     assert runner.request_wristband_placement_change("band-nonexistent", BandSide.LEFT_ANKLE) is False
+
+
+class _RecordingMotionResolver:
+    """Duck-typed stand-in that just records the IMU streams it was
+    handed (via detected_people_poses/candidate_imu_streams) instead of
+    doing any real correlation -- used to verify StationSessionRunner.
+    tick() feeds the disambiguator clock-synced samples (Priority 5's
+    "fuse ... clock synchronization" requirement), not raw ones."""
+
+    def __init__(self):
+        self.seen_imu_streams = []
+
+    def resolve(self, candidate_imu_streams, detected_people_poses, pose_fps, prior_slot_assignment=None):
+        self.seen_imu_streams.append({k: list(v) for k, v in candidate_imu_streams.items()})
+        return [None] * len(detected_people_poses)
+
+
+def test_disambiguator_receives_clock_synced_imu_not_raw_samples():
+    from irix.live.disambiguation import CrowdedGroupDisambiguator
+
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    registry.check_out("band-2", "member-bob", timestamp=0.0)
+    present = [
+        BLEReading(station_id="station-1", rssi=-40.0, timestamp=0.0, wristband_id="band-1"),
+        BLEReading(station_id="station-1", rssi=-41.0, timestamp=0.0, wristband_id="band-2"),
+    ]
+
+    fs = 50.0
+    true_lead_s = 0.4
+    raw_alice = synthetic_imu_stream(n_seconds=0.2, fs=fs, reps_per_second=0.5, seed=1)
+    imu_alice_stream = _ChunkedIMUStream(raw_alice, samples_per_poll=len(raw_alice))
+    imu_bob_stream = _ChunkedIMUStream([], samples_per_poll=1)
+
+    resolver = _RecordingMotionResolver()
+    runner = StationSessionRunner(
+        station_id="station-1",
+        exercise_name="squat",
+        checkout_registry=registry,
+        frame_source=_FakeFrameSource(3),
+        ble_reader=_ScriptedBLEReader([present] * 3),
+        imu_stream_factory=lambda wid: imu_alice_stream if wid == "band-1" else imu_bob_stream,
+        pose_estimator=_TwoPersonScriptedPoseEstimator([_pose_for_angle(90.0)], [_pose_for_angle(90.0)]),
+        clock=_FakeClock(step=0.1),
+        motion_resolver=resolver,
+        disambiguation_window_frames=1,
+    )
+
+    # Pre-calibrate band-1's clock before any tick, so the very first
+    # poll already has a correction to apply -- isolates "was the
+    # correction applied" from "had a set closed yet to produce one".
+    runner.tick(frame=np.zeros((2, 2, 3), dtype=np.uint8), now=0.0, present_wristband_ids=["band-1", "band-2"])
+    runner.calibrate_wristband_clock("band-1", offset_s=-true_lead_s, confidence=1.0, at_time=0.0)
+
+    imu_alice_stream2 = _ChunkedIMUStream(raw_alice, samples_per_poll=len(raw_alice))
+    runner._imu_streams["band-1"] = imu_alice_stream2
+    runner.tick(frame=np.zeros((2, 2, 3), dtype=np.uint8), now=0.1, present_wristband_ids=["band-1", "band-2"])
+
+    assert len(resolver.seen_imu_streams) >= 1
+    seen_alice = resolver.seen_imu_streams[-1]["member-alice"]
+    assert len(seen_alice) == len(raw_alice)
+    assert seen_alice[0].timestamp == pytest.approx(raw_alice[0].timestamp - true_lead_s, abs=1e-9)
