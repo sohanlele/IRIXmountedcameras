@@ -2,11 +2,12 @@
 
 Measures wall-clock latency/throughput for every pure-software subsystem
 in this repo (pose tracking, exercise recognition, sensor fusion, clock
-sync, the full simulated live-gym pipeline), plus camera-reconnect and
-BLE-disconnect-recovery timing, CPU time, and peak memory -- using only
-the Python standard library (``time``, ``resource``) so this runs
-anywhere this repo's core dependencies already run, no extra install
-required.
+sync, identity/motion-correlation resolution, per-frame event-producing
+pipeline latency, the full simulated live-gym pipeline), plus
+camera-reconnect timing, BLE-disconnect-recovery timing, BLE packet-loss
+degradation behavior, CPU time, and peak memory -- using only the Python
+standard library (``time``, ``resource``) so this runs anywhere this
+repo's core dependencies already run, no extra install required.
 
 **What's honestly not measured here, and why:** GPU utilization and real
 pose-inference FPS need ``ultralytics``/``torch`` and (for GPU numbers) an
@@ -191,6 +192,83 @@ def benchmark_clock_sync() -> TimingResult:
     return result
 
 
+def benchmark_identity_resolution_latency(n_candidates: int = 3, window_frames: int = 60) -> TimingResult:
+    """Priority 9's "identity latency" -- how long
+    ``irix.identity.motion_correlation.MotionCorrelationResolver.resolve``
+    takes to disambiguate a crowded station once its buffering window is
+    full (the actual per-resolution cost; the buffering wait itself is a
+    fixed, configured window duration, not a compute cost -- see
+    ``irix.live.disambiguation.CrowdedGroupDisambiguator``). Scales with
+    ``n_candidates`` (default 3, this repo's documented "small number of
+    co-located members" design point -- see that resolver's own module
+    docstring) and the window length."""
+    from irix.demo.mock_pose import synthetic_imu_stream, synthetic_pose_stream
+    from irix.identity.motion_correlation import MotionCorrelationResolver
+    from irix.rep_counting.exercises import SQUAT
+
+    resolver = MotionCorrelationResolver()
+    candidate_imu_streams = {
+        f"member-{i}": synthetic_imu_stream(n_seconds=window_frames / 30.0, reps_per_second=0.4 + i * 0.05, seed=i)
+        for i in range(n_candidates)
+    }
+    detected_people_poses = [
+        [p for _, _, p in synthetic_pose_stream(SQUAT, n_frames=window_frames, reps_per_second=0.4 + i * 0.05)]
+        for i in range(n_candidates)
+    ]
+
+    def _run():
+        resolver.resolve(candidate_imu_streams, detected_people_poses, pose_fps=30.0)
+
+    result = _time_it(_run, n=50)
+    result.name = f"identity.MotionCorrelationResolver.resolve ({n_candidates} candidates, {window_frames}-frame window)"
+    return result
+
+
+def benchmark_event_latency() -> TimingResult:
+    """Priority 9's "event latency" -- wall-clock time from one
+    ``RepSession.process_frame`` call (a frame + pose arriving) to
+    whatever events it produces being returned, at the point in a set
+    where a rep actually completes (the most expensive frame -- also
+    exercises FormScorer/fatigue-sample construction, unlike a
+    no-op mid-rep frame)."""
+    import math as _math
+
+    import numpy as _np
+
+    from irix.pipeline.rep_session import RepSession
+    from irix.pose.estimator import COCO_KEYPOINT_NAMES, KEYPOINT_INDEX, Keypoint, PersonPose
+    from irix.rep_counting.exercises import SQUAT
+
+    def _pose_for_angle(angle_deg: float) -> PersonPose:
+        knee = _np.array([0.0, 0.0])
+        hip = knee + _np.array([0.0, -100.0])
+        theta = _math.radians(-90 + angle_deg)
+        ankle = knee + 100.0 * _np.array([_math.cos(theta), _math.sin(theta)])
+        keypoints = [Keypoint(x=0.0, y=0.0, confidence=0.0) for _ in COCO_KEYPOINT_NAMES]
+
+        def _set(name, xy):
+            keypoints[KEYPOINT_INDEX[name]] = Keypoint(x=float(xy[0]), y=float(xy[1]), confidence=0.9)
+
+        _set("left_hip", hip)
+        _set("left_knee", knee)
+        _set("left_ankle", ankle)
+        return PersonPose(keypoints=keypoints, bbox=(0.0, 0.0, 200.0, 200.0))
+
+    session = RepSession(exercise_name="squat", member_id="bench-member", station_id="bench-station")
+    angles = list(_np.linspace(90.0, 170.0, 10))  # one full rep's worth of frames
+    frame = _np.zeros((2, 2, 3), dtype=_np.uint8)
+    ts_counter = [0.0]
+
+    def _run():
+        for angle in angles:
+            ts_counter[0] += 1.0 / 30.0
+            session.process_frame(frame=frame, ts=ts_counter[0], person=_pose_for_angle(angle))
+
+    result = _time_it(_run, n=30, warmup=3)
+    result.name = "pipeline.RepSession.process_frame (per rep-completing frame batch)"
+    return result
+
+
 def benchmark_live_gym_pipeline(n_ticks: int = 260) -> Dict:
     """The most representative "processing FPS" number available without
     real camera/pose-model hardware: the full simulated live pipeline
@@ -209,6 +287,47 @@ def benchmark_live_gym_pipeline(n_ticks: int = 260) -> Dict:
         "ms_per_tick": round((elapsed_s / n_ticks) * 1000.0, 4) if n_ticks > 0 else None,
         "n_events_produced": len(events),
     }
+
+
+def benchmark_packet_loss_impact(loss_levels=(0.0, 0.1, 0.3, 0.5)) -> Dict:
+    """Priority 9's "packet loss" -- not a timing number, a *behavioral*
+    one: how ``irix.fusion.rep_fusion.RepCountFusion`` actually degrades
+    as a wristband's BLE packet loss rate rises, using the same
+    ``imu_sample_completeness`` signal that fusion's own confidence
+    discount is based on (``irix.fusion.rep_fusion``'s module docstring).
+    Confirms graceful degradation (completeness drops roughly with the
+    loss rate; fusion never silently keeps trusting the IMU count as if
+    nothing were missing) rather than a hard failure at some threshold.
+    """
+    from irix.demo.mock_pose import synthetic_imu_stream
+    from irix.fusion.rep_fusion import RepCountFusion
+
+    rng = np.random.default_rng(11)
+    base_samples = synthetic_imu_stream(n_seconds=16.0, reps_per_second=0.5, seed=3)
+    fusion = RepCountFusion()
+
+    results = []
+    for loss_pct in loss_levels:
+        if loss_pct <= 0.0:
+            kept = base_samples
+        else:
+            keep_mask = rng.random(len(base_samples)) >= loss_pct
+            kept = [s for s, keep in zip(base_samples, keep_mask) if keep]
+        fused = fusion.fuse(
+            camera_count=8, camera_confidence=0.9, imu_samples=kept,
+            camera_rep_durations=[2.0] * 8,
+        )
+        results.append({
+            "packet_loss_pct": loss_pct,
+            "n_samples_kept": len(kept),
+            "n_samples_expected": len(base_samples),
+            "imu_sample_completeness": fused.imu_sample_completeness,
+            "fused_rep_count": fused.fused_count,
+            "rep_count_source": fused.source,
+            "agreement": fused.agreement,
+        })
+
+    return {"loss_levels": list(loss_levels), "results": results}
 
 
 def benchmark_camera_reconnect_schedule(backoff_s: float = 2.0, max_backoff_s: float = 30.0, n_failures: int = 6) -> Dict:
@@ -336,11 +455,14 @@ def run_all() -> Dict:
             benchmark_rep_fusion().to_dict(),
             benchmark_ekf().to_dict(),
             benchmark_clock_sync().to_dict(),
+            benchmark_identity_resolution_latency().to_dict(),
+            benchmark_event_latency().to_dict(),
         ],
         "pose_inference": benchmark_pose_inference(),
         "live_pipeline_throughput": benchmark_live_gym_pipeline(n_ticks=260),
         "camera_reconnect": benchmark_camera_reconnect_schedule(),
         "ble_disconnect_recovery": benchmark_ble_disconnect_recovery(),
+        "packet_loss_impact": benchmark_packet_loss_impact(),
     }
 
     cpu_after = resource.getrusage(resource.RUSAGE_SELF)
@@ -390,6 +512,14 @@ def format_report(report: Dict) -> str:
         f"BLE disconnect recovery: {ble['outage_s']}s outage vs {ble['presence_timeout_s']}s timeout "
         f"(margin {ble['recovery_margin_s']}s, survives={ble['session_survives']})"
     )
+    lines.append("")
+    pl = report["packet_loss_impact"]
+    lines.append("Packet loss impact on IMU/camera fusion:")
+    for r in pl["results"]:
+        lines.append(
+            f"  {int(r['packet_loss_pct'] * 100)}% loss: completeness={r['imu_sample_completeness']}, "
+            f"source={r['rep_count_source']}, agreement={r['agreement']}"
+        )
     lines.append("")
     ru = report["resource_usage"]
     lines.append(

@@ -145,6 +145,11 @@ completed this phase removed, new gaps this phase's work surfaced added.
       iron/rubber plates -- see `plate_color_check.py`'s own "what this
       doesn't cover" note) -- same real gap as machine-stack reading
       above, same blocker (no OCR model, no labeled data here).
+- [x] ~~Extend benchmarks: identity latency, event latency~~ -- done
+      (Priority 9): `benchmark_identity_resolution_latency`,
+      `benchmark_event_latency`, and `benchmark_packet_loss_impact`
+      (BLE packet loss vs. fusion degradation, not a timing number but a
+      behavioral one) added to `irix/benchmark/run_benchmarks.py`.
 - [ ] **Real pose-inference + GPU benchmarks** once `ultralytics`/CUDA
       are available (not in this sandboxed environment) --
       `irix.benchmark.benchmark_pose_inference`/`_gpu_available` already
