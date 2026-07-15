@@ -186,6 +186,21 @@ class GymSessionRunner:
         del self._workout_states[wristband_id]
         return True
 
+    def force_end_session(self, wristband_id: str) -> bool:
+        """Explicit backend-triggered session end (Priority 11 -- e.g. a
+        Studio operator ending a member's workout early) distinct from
+        ``record_wristband_returned``: this only advances the
+        `WorkoutStateMachine` to ``SESSION_ENDED`` and leaves it tracked
+        (a member who's done training but hasn't walked to the front
+        desk yet still has their band on) -- the actual physical hand-
+        back is a separate, later event. Returns whether a tracked
+        session for this band existed at all."""
+        machine = self._workout_states.get(wristband_id)
+        if machine is None:
+            return False
+        machine.force_end_session()
+        return True
+
     def close_stale_sessions(self, now: Optional[float] = None) -> None:
         """A band that hasn't produced any BLE reading anywhere for
         ``presence_timeout_s`` is considered to have ended its *workout*

@@ -5,6 +5,17 @@ completed this phase removed, new gaps this phase's work surfaced added.
 
 ## High priority
 
+- [x] ~~IRIX Studio backend interface~~ -- done (Priority 11):
+      `irix.backend.studio_api.StudioBackendAPI` (`assign_wristband`,
+      `return_wristband`, `start_session`, `end_session`,
+      `query_battery`, `query_assignment`, `query_wristband_status`,
+      `request_placement_change`), backed by `CheckoutRegistry` +
+      `GymSessionRunner`. `query_battery` intentionally always reports
+      `"unknown"` -- no real battery signal exists yet. See
+      `docs/BACKEND_API.md`. **Not done**: no real network transport
+      wraps this class yet (plain in-process Python today) -- future
+      work once an actual Studio project exists to consume it.
+
 - [ ] **Wire `irix.exercise_recognition.recognize_exercise` into session
       start** so a station can auto-detect/confirm the exercise instead
       of only trusting `StationInfo.default_exercise` -- needs a real
@@ -119,8 +130,10 @@ completed this phase removed, new gaps this phase's work surfaced added.
       input anywhere: a just-arrived member's first detected movement as
       a corroborating signal, distinct from `irix.identity.
       motion_correlation`'s steady-state periodic correlation.
-- [ ] **Add `schema_version` to the `CameraEvent` family** (still open --
-      see `docs/API_SPEC.md`).
+- [x] ~~Add `schema_version` to the `CameraEvent` family~~ -- done
+      (Priority 11/13): `EVENT_SCHEMA_VERSION` in `irix/pipeline/
+      schema.py`, present in every event's `to_dict()`. See
+      `docs/API_SPEC.md`.
 - [ ] **Barbell/plate object detector** (`FreeWeightDetector`, still an
       untrained stub) -- fine-tune against the Roboflow "Barbells
       Detector" dataset or evaluate a hosted inference API. Once real,

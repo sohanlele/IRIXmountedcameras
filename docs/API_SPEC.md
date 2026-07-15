@@ -9,17 +9,18 @@ two disagree, the code is correct and this file needs updating (see
 
 ## Versioning status
 
-**Current state: unversioned.** There is one flat `CameraEvent` union
-type with no `schema_version`/`event_version` field, and `HTTPCloudSync`
-(`irix/pipeline/cloud_sync.py`) has no version negotiation. This is a
-real gap against the founding brief's "versioned event API" requirement
--- acceptable while `irix-mvp-app` doesn't yet expose a live-ingestion
-endpoint to version against (see `docs/PRODUCT_SPEC.md`), but should be
-closed before a real integration: recommended approach is a top-level
-`schema_version: int` field on every event (bump on any breaking field
-change) plus an `event_type` string discriminator (already present on
-every event's `to_dict()` output today) so a consumer can dispatch on
-type without needing Python's `Union` typing. See `docs/TODO.md`.
+**Done (Phase 3, Priority 11/13).** Every event's `to_dict()` output now
+carries `"schema_version": irix.pipeline.schema.EVENT_SCHEMA_VERSION`
+(currently `1`) alongside the existing `event_type` string
+discriminator, so a consumer can dispatch/validate on type and version
+without needing Python's `Union` typing -- exactly the approach this
+section previously only recommended. Bump `EVENT_SCHEMA_VERSION` on any
+breaking field change to the `CameraEvent` family. **Still open:**
+`HTTPCloudSync` (`irix/pipeline/cloud_sync.py`) itself has no version
+negotiation with a receiving endpoint (it has no real endpoint to
+negotiate with yet at all -- see `docs/PRODUCT_SPEC.md`); the field
+existing on every event is necessary but not sufficient for a real
+version-aware integration.
 
 ## Transport today
 

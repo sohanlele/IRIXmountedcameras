@@ -16,10 +16,16 @@ checklist. Each item: current status, and what's left.
    `run_live_gym_demo.py`. Connect (real hardware): not started, see
    `docs/WRISTBAND_SYSTEM.md`.
 4. **Assign wristbands to members through the IRIX Studio API.**
-   Partial -- `CheckoutRegistry` is the software-side record of an
-   assignment; there is no actual IRIX Studio integration (separate
-   project, out of this repo's scope per the founding brief) calling
-   into it yet.
+   Partial -- as of 2026-07-14, `irix.backend.studio_api.
+   StudioBackendAPI` is the concrete backend surface this repo exposes
+   for a future Studio to call (`assign_wristband`, `return_wristband`,
+   `start_session`, `end_session`, `query_battery`, `query_assignment`,
+   `query_wristband_status`, `request_placement_change`) -- see
+   `docs/BACKEND_API.md`. Building IRIX Studio itself (the member-
+   facing app/staff console) remains out of this repo's scope per the
+   founding brief; `query_battery` also stays honestly "unknown" until
+   a real battery signal exists on hardware (see
+   `docs/WRISTBAND_SYSTEM.md`).
 5. **Track members as they move throughout the gym.** Real --
    `GymCoordinator`/`GymSessionRunner`, demonstrated end to end in
    `run_live_gym_demo.py` (a real `StationHandoffEvent`).

@@ -30,6 +30,17 @@ def _now() -> float:
     return time.monotonic()
 
 
+# Bumped on any breaking field change to the CameraEvent family (Priority
+# 11/13's "emit versioned workout events" -- see docs/API_SPEC.md's
+# "Versioning status" section). Included in every event's to_dict()
+# output as "schema_version" so a consumer (irix-mvp-app, or the Studio
+# backend interface in irix.backend.studio_api) can dispatch/validate
+# against a known version without needing Python's Union typing, per
+# that section's own recommended approach -- now actually implemented,
+# not just recommended.
+EVENT_SCHEMA_VERSION = 1
+
+
 @dataclass
 class RepCompletedEvent:
     """One rep just finished (irix.rep_counting.state_machine.RepEvent,
@@ -87,6 +98,7 @@ class RepCompletedEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "rep_completed",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "station_id": self.station_id,
             "exercise": self.exercise,
@@ -133,6 +145,7 @@ class SetCompleteEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "set_complete",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "station_id": self.station_id,
             "exercise": self.exercise,
@@ -162,6 +175,7 @@ class BandPlacementRequiredEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "band_placement_required",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "exercise": self.exercise,
             "from_placement": self.from_placement,
@@ -190,6 +204,7 @@ class BandPlacementConfirmedEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "band_placement_confirmed",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "wristband_id": self.wristband_id,
             "from_side": self.from_side,
             "to_side": self.to_side,
@@ -253,6 +268,7 @@ class WeightConfirmedEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "weight_confirmed",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "station_id": self.station_id,
             "exercise": self.exercise,
@@ -294,6 +310,7 @@ class StationHandoffEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "station_handoff",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "from_station": self.from_station,
             "to_station": self.to_station,
@@ -332,6 +349,7 @@ class SetFatigueSummaryEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "set_fatigue_summary",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "station_id": self.station_id,
             "exercise": self.exercise,
@@ -368,6 +386,7 @@ class TrackingLostEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "tracking_lost",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "station_id": self.station_id,
             "consecutive_missed_frames": self.consecutive_missed_frames,
@@ -390,6 +409,7 @@ class TrackingRecoveredEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "tracking_recovered",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "station_id": self.station_id,
             "gap_duration_s": self.gap_duration_s,
@@ -419,6 +439,7 @@ class RestStartedEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "rest_started",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "station_id": self.station_id,
             "exercise": self.exercise,
@@ -446,6 +467,7 @@ class RestEndedEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "rest_ended",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "station_id": self.station_id,
             "exercise": self.exercise,
@@ -474,6 +496,7 @@ class ExerciseDetectedEvent:
     def to_dict(self) -> dict:
         return {
             "event_type": "exercise_detected",
+            "schema_version": EVENT_SCHEMA_VERSION,
             "member_id": self.member_id,
             "station_id": self.station_id,
             "exercise": self.exercise,

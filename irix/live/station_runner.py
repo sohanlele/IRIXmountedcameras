@@ -372,6 +372,23 @@ class StationSessionRunner:
             )
         return events
 
+    def placement_status(self, wristband_id: str):
+        """This band's current ``irix.identity.placement.PlacementStatus``
+        if a session for it is open here, else ``None``. Read-only
+        accessor -- ``request_wristband_placement_change`` is the only
+        supported way to change it (Priority 11: this is the kind of
+        small, explicit accessor a Studio backend interface needs
+        instead of reaching into ``self._placement_trackers`` directly)."""
+        tracker = self._placement_trackers.get(wristband_id)
+        return tracker.status() if tracker is not None else None
+
+    def clock_sync_status(self, wristband_id: str):
+        """This band's current ``irix.fusion.clock_sync.
+        ClockSyncEstimate`` if a session for it is open here, else
+        ``None``."""
+        estimator = self._clock_sync_estimators.get(wristband_id)
+        return estimator.estimate() if estimator is not None else None
+
     def request_wristband_placement_change(
         self, wristband_id: str, to_side: BandSide, at_time: Optional[float] = None,
     ) -> bool:
