@@ -87,6 +87,7 @@ from ..identity.placement import BandSide, WristbandPlacementTracker
 from ..pipeline.rep_session import RepSession
 from ..pipeline.schema import BandPlacementConfirmedEvent, CameraEvent, TrackingLostEvent, TrackingRecoveredEvent
 from ..pose.calibration import CalibrationProfile
+from ..recording.session_recorder import SessionRecorder
 from ..weight_recognition.vlm_backend import VLMBackend
 from .disambiguation import CrowdedGroupDisambiguator
 
@@ -112,6 +113,7 @@ class StationSessionRunner:
         disambiguation_window_frames: int = 60,
         calibration_profile: Optional[CalibrationProfile] = None,
         tracking_lost_after_frames: int = 15,
+        session_recorder: Optional[SessionRecorder] = None,
     ):
         """``ble_reader``: called once per frame tick (in ``run_forever``
         only -- ``tick()`` called directly, e.g. by ``irix.live.
@@ -163,6 +165,20 @@ class StationSessionRunner:
         Deliberately a streak, not a single missed frame -- an ordinary
         detector miss on one frame (motion blur, brief self-occlusion)
         shouldn't itself be reported as a tracking-loss incident.
+
+        ``session_recorder``: an ``irix.recording.session_recorder.
+        SessionRecorder`` (Priority 8) to feed every frame/IMU
+        batch/event this station produces into, for later deterministic
+        replay or algorithm comparison. Opt-in and ``None`` by default --
+        recording (especially raw video, itself further opt-in on the
+        recorder's own ``save_raw_frames``) is a deliberate choice a
+        deployment makes for a specific station/time window, not default
+        production behavior. One recorder covers this station's whole
+        run, spanning however many different members' sessions come and
+        go -- every recorded event/sample is already member_id-tagged
+        (see each event/IMU sample's own fields), so slicing a single
+        member's activity back out happens at analysis time, not by
+        needing a fresh recorder per member session.
         """
         self.station_id = station_id
         self.exercise_name = exercise_name
@@ -173,6 +189,7 @@ class StationSessionRunner:
         self.pose_estimator = pose_estimator
         self.calibration_profile = calibration_profile
         self.tracking_lost_after_frames = tracking_lost_after_frames
+        self.session_recorder = session_recorder
         self.presence_timeout_s = presence_timeout_s
         self._clock = clock or time.monotonic
         self._session_kwargs = dict(
@@ -251,7 +268,7 @@ class StationSessionRunner:
             placement_tracker=placement_tracker,
             **self._session_kwargs,
         )
-        self._on_events(session.initial_events)
+        self._emit(session.initial_events)
         self._sessions[wristband_id] = session
         self._clock_sync_estimators[wristband_id] = clock_sync_estimator
         self._placement_trackers[wristband_id] = placement_tracker
@@ -267,7 +284,7 @@ class StationSessionRunner:
         self._tracking_lost.pop(wristband_id, None)
         self._tracking_lost_since.pop(wristband_id, None)
         if session is not None:
-            self._on_events(session.close(end_ts=end_ts))
+            self._emit(session.close(end_ts=end_ts))
         # A session ending always coincides with a present-set change,
         # which the disambiguator's own route() already detects and
         # resets for on its next call -- resetting here too is a harmless,
@@ -304,6 +321,17 @@ class StationSessionRunner:
             at_time=at_time if at_time is not None else self._clock(), offset_s=offset_s, confidence=confidence,
         )
         return True
+
+    def _emit(self, events: List[CameraEvent]) -> None:
+        """Every event this station produces flows through here --
+        pushed to ``on_events`` (unchanged, still the primary hook) and,
+        if a ``session_recorder`` is configured, also logged there
+        (Priority 8). A thin wrapper specifically so every existing
+        `self._on_events(...)` call site didn't need its own separate
+        recorder call bolted on next to it."""
+        self._on_events(events)
+        if self.session_recorder is not None and events:
+            self.session_recorder.record_events(events)
 
     def _track_tracking_loss(self, wristband_id: str, person_detected: bool, now: float) -> List[CameraEvent]:
         """Streak-based TrackingLostEvent/TrackingRecoveredEvent (see
@@ -406,6 +434,8 @@ class StationSessionRunner:
 
         if self.calibration_profile is not None:
             frame = self.calibration_profile.undistort_frame(frame)
+        if self.session_recorder is not None:
+            self.session_recorder.record_frame(frame, now)
         estimator = self._ensure_estimator()
         people = estimator.estimate(frame)
 
@@ -416,6 +446,8 @@ class StationSessionRunner:
         for wristband_id, imu_stream in self._imu_streams.items():
             samples = imu_stream.poll() if imu_stream is not None else []
             polled[wristband_id] = samples
+            if self.session_recorder is not None and samples:
+                self.session_recorder.record_imu_samples(samples)
             tracker = self._placement_trackers.get(wristband_id)
             side_before = tracker.current_side if tracker is not None else None
             self._sessions[wristband_id].add_imu_samples(samples)
@@ -424,7 +456,7 @@ class StationSessionRunner:
             # confirmation here so it becomes a real, observable event
             # rather than a change only visible by polling tracker state.
             if tracker is not None and tracker.current_side != side_before:
-                self._on_events([
+                self._emit([
                     BandPlacementConfirmedEvent(
                         wristband_id=wristband_id,
                         from_side=side_before.value if side_before is not None else "unknown",
@@ -440,8 +472,8 @@ class StationSessionRunner:
                 session = self._sessions.get(wristband_id)
                 if session is not None:
                     person = people[0] if people else None
-                    self._on_events(self._track_tracking_loss(wristband_id, person is not None, now))
-                    self._on_events(session.process_frame(frame, now, person))
+                    self._emit(self._track_tracking_loss(wristband_id, person is not None, now))
+                    self._emit(session.process_frame(frame, now, person))
             return
 
         # Identity/motion-correlation disambiguation (irix.identity.
@@ -473,7 +505,7 @@ class StationSessionRunner:
         for wristband_id, pose in routed.items():
             session = self._sessions.get(wristband_id)
             if session is not None:
-                self._on_events(session.process_frame(frame, now, pose))
+                self._emit(session.process_frame(frame, now, pose))
 
     def run_forever(self, max_frames: Optional[int] = None) -> None:
         """Runs until ``frame_source`` stops yielding (only happens in

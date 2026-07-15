@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from irix.fusion.imu_io import load_imu_samples
+from irix.fusion.imu import IMUSample
+from irix.fusion.imu_io import load_imu_samples, save_imu_samples
 
 
 def _write_csv(path, rows, header="timestamp,accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z"):
@@ -79,3 +80,39 @@ def test_empty_file_raises_value_error(tmp_path):
     _write_csv(path, [])
     with pytest.raises(ValueError, match="no IMU samples"):
         load_imu_samples(str(path))
+
+
+def test_save_then_load_round_trips_through_csv(tmp_path):
+    import numpy as np
+
+    samples = [
+        IMUSample(timestamp=0.0, accel=np.array([0.1, 0.2, -9.8]), gyro=np.array([0.01, 0.02, 0.03])),
+        IMUSample(timestamp=0.5, accel=np.array([0.0, 0.0, -9.81]), gyro=np.array([0.0, 0.0, 0.0])),
+    ]
+    path = str(tmp_path / "roundtrip.csv")
+    save_imu_samples(samples, path)
+    reloaded = load_imu_samples(path)
+
+    assert [s.timestamp for s in reloaded] == [0.0, 0.5]
+    assert reloaded[0].accel.tolist() == pytest.approx([0.1, 0.2, -9.8])
+    assert reloaded[0].gyro.tolist() == pytest.approx([0.01, 0.02, 0.03])
+
+
+def test_save_then_load_round_trips_through_json(tmp_path):
+    import numpy as np
+
+    samples = [IMUSample(timestamp=1.0, accel=np.array([1.0, 2.0, 3.0]), gyro=np.array([4.0, 5.0, 6.0]))]
+    path = str(tmp_path / "roundtrip.json")
+    save_imu_samples(samples, path)
+    reloaded = load_imu_samples(path)
+
+    assert reloaded[0].timestamp == 1.0
+    assert reloaded[0].accel.tolist() == [1.0, 2.0, 3.0]
+
+
+def test_save_with_unrecognized_extension_raises():
+    import numpy as np
+
+    samples = [IMUSample(timestamp=0.0, accel=np.zeros(3), gyro=np.zeros(3))]
+    with pytest.raises(ValueError):
+        save_imu_samples(samples, "/tmp/whatever.txt")

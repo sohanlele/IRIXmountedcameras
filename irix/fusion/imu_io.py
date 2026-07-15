@@ -111,3 +111,31 @@ def load_imu_samples(path: str) -> List[IMUSample]:
         raise ValueError(f"{path}: no IMU samples found in file")
     samples.sort(key=lambda s: s.timestamp)
     return samples
+
+
+def save_imu_samples(samples: List[IMUSample], path: str) -> None:
+    """Write ``IMUSample``s back out in the same CSV/JSON contract
+    ``load_imu_samples`` reads (chosen by ``path``'s extension) -- the
+    missing write side of this module, added for ``irix.recording.
+    session_recorder`` (Priority 8: session recording needs to produce
+    files this same module can later load back in for deterministic
+    replay, not a second, divergent format)."""
+    ext = os.path.splitext(path)[1].lower()
+    rows = [
+        {
+            "timestamp": s.timestamp,
+            "accel_x": float(s.accel[0]), "accel_y": float(s.accel[1]), "accel_z": float(s.accel[2]),
+            "gyro_x": float(s.gyro[0]), "gyro_y": float(s.gyro[1]), "gyro_z": float(s.gyro[2]),
+        }
+        for s in samples
+    ]
+    if ext == ".csv":
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(_REQUIRED_FIELDS))
+            writer.writeheader()
+            writer.writerows(rows)
+    elif ext == ".json":
+        with open(path, "w") as f:
+            json.dump(rows, f)
+    else:
+        raise ValueError(f"{path}: unrecognized IMU file extension {ext!r} -- expected .csv or .json")

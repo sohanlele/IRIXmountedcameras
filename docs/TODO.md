@@ -92,6 +92,14 @@ completed this phase removed, new gaps this phase's work surfaced added.
       `identity_degraded` states exist to consume it -- built in that
       order deliberately (a resolution with nowhere to go is just an
       unused data class).
+- [ ] **`SessionRecorder` not wired into `GymSessionRunner`.** Wired
+      into `StationSessionRunner` only (Phase 3, Priority 8) -- a
+      multi-station gym run has no single place recording across
+      stations yet; a caller wanting a whole-gym recording currently has
+      to construct one `SessionRecorder` per station manually. Also:
+      `frames/*.npy` (the opt-in raw-frame path) has no companion video
+      encoder -- fine for algorithm-comparison/replay (frame arrays load
+      straight back into numpy), not yet a shareable video file.
 - [ ] **Wire per-station rep/set events into the gym-wide
       `WorkoutStateMachine`.** `irix.live.gym_runner.GymSessionRunner`
       now drives session/identity/station-transition/health phases

@@ -705,3 +705,41 @@ def test_a_brief_single_frame_miss_does_not_fire_tracking_lost():
     runner.run_forever(max_frames=n_frames)
 
     assert not [e for e in events if isinstance(e, TrackingLostEvent)]
+
+
+def test_session_recorder_captures_frames_imu_and_events_across_a_run(tmp_path):
+    from irix.recording.session_recorder import SessionRecorder, load_recorded_session
+
+    registry = CheckoutRegistry()
+    registry.check_out("band-1", "member-alice", timestamp=0.0)
+    present = [BLEReading(station_id="station-1", rssi=-40.0, timestamp=0.0, wristband_id="band-1")]
+
+    fs = 50.0
+    imu_samples = synthetic_imu_stream(n_seconds=0.4, fs=fs, reps_per_second=0.5, seed=1)
+    imu_stream = _ChunkedIMUStream(imu_samples, samples_per_poll=10)
+
+    out_dir = str(tmp_path / "recording")
+    recorder = SessionRecorder(output_dir=out_dir, station_id="station-1", exercise_name="squat")
+
+    n_frames = 20
+    runner = StationSessionRunner(
+        station_id="station-1",
+        exercise_name="squat",
+        checkout_registry=registry,
+        frame_source=_FakeFrameSource(n_frames),
+        ble_reader=_ScriptedBLEReader([present] * n_frames),
+        imu_stream_factory=lambda wid: imu_stream,
+        pose_estimator=_ScriptedPoseEstimator(_TWO_REPS),
+        clock=_FakeClock(step=0.1),
+        session_recorder=recorder,
+    )
+    runner.run_forever(max_frames=n_frames)
+    runner.close()
+    recorder.close()
+
+    session = load_recorded_session(out_dir)
+    assert session.metadata["station_id"] == "station-1"
+    assert len(session.frames) == n_frames
+    assert len(session.imu_samples) > 0
+    assert len(session.events) > 0
+    assert any(e["event_type"] == "rep_completed" for e in session.events)
