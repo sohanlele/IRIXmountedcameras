@@ -109,6 +109,7 @@ class StationSessionRunner:
         barbell_detector: Optional[FreeWeightDetector] = None,
         rest_gap_s: float = 20.0,
         bar_weight_kg: float = MENS_OLYMPIC_BARBELL_WEIGHT_KG,
+        camera_tilt_deg: float = 0.0,
         on_events: Optional[Callable[[List[CameraEvent]], None]] = None,
         clock: Optional[Callable[[], float]] = None,
         motion_resolver: Optional[MotionCorrelationResolver] = None,
@@ -147,6 +148,18 @@ class StationSessionRunner:
         crowded station (2+ checked-out bands present at once) gets
         disambiguated -- see the module docstring. Irrelevant whenever at
         most one band is present, which is the common case.
+
+        ``camera_tilt_deg``: forwarded straight through to every
+        ``RepSession`` this runner opens (Priority 12 -- this was
+        previously accepted by ``irix.config.gym_config.
+        station_runner_kwargs_for`` but silently dropped on the floor
+        here, since this constructor had no matching parameter to
+        receive it in; caught by ``tests/
+        test_config_driven_live_pipeline.py`` building a real config-
+        driven runner end to end, the same class of gap as the earlier
+        ``bar_weight_kg`` fix -- see ``docs/TODO.md``). ``0.0`` (no tilt
+        correction) is correct for any station whose camera mounting
+        angle hasn't been measured yet.
 
         ``calibration_profile``: this station's install-time ``irix.
         pose.calibration.CalibrationProfile`` (checkerboard intrinsics,
@@ -200,6 +213,7 @@ class StationSessionRunner:
             barbell_detector=barbell_detector,
             rest_gap_s=rest_gap_s,
             bar_weight_kg=bar_weight_kg,
+            camera_tilt_deg=camera_tilt_deg,
         )
         self._on_events = on_events or (lambda events: None)
         self._disambiguator = CrowdedGroupDisambiguator(

@@ -4,15 +4,27 @@
 
 ```bash
 $ pytest -q
-237 passed, 3 skipped in ~1.6s
+402 passed, 3 skipped in ~8s
 ```
 
-~7,990 lines of `irix/` source, ~4,715 lines of `tests/` (one test file
-per module, plus integration/smoke tests) as of this writing. The 3
-skips are the tests requiring `google-genai`/a live network call that
-this environment doesn't exercise by default -- not failures, and not
-representative of untested code (`tests/test_gemini_vlm_backend.py`
+(Was 237 as of Phase 2; grew to 389 across Phase 3's Priorities 1-11,
+then to 402 with Priority 12's own validation-expansion work below.)
+The 3 skips are the tests requiring `google-genai`/a live network call
+that this environment doesn't exercise by default -- not failures, and
+not representative of untested code (`tests/test_gemini_vlm_backend.py`
 itself runs and passes; only the true live-network path is skipped).
+
+This number stops needing manual upkeep as of Phase 3, Priority 12:
+`python -m irix.validation.report_generator` regenerates a dated
+Markdown report with the real current pass/fail/skip counts (and,
+unless `--skip-benchmarks` is passed, the full `irix.benchmark.
+run_benchmarks` performance suite) from a real subprocess `pytest`
+run every time it's invoked -- see `docs/BACKEND_API.md`-style
+treatment isn't needed here since the tool's own docstring
+(`irix/validation/report_generator.py`) covers usage. It deliberately
+does not try to auto-generate this file's qualitative sections below
+("what's genuinely validated," "what's not") -- those require human
+judgment about what a passing test actually proves.
 
 ## What's genuinely validated (not mocked end to end)
 
@@ -42,6 +54,24 @@ itself runs and passes; only the true live-network path is skipped).
   packet-loss/disconnect behavior against exact tick counts (not just
   "roughly happens sometimes") and that `calibrate_stationary` recovers
   a known injected bias to a tight tolerance.
+
+- **The config system, end to end with the live orchestration layer**:
+  previously, `tests/test_gym_config.py` only checked that
+  `irix.config.gym_config`'s factory functions produced kwargs that
+  *could* construct a working `RepSession` in isolation -- the config
+  system and `StationSessionRunner`/`GymSessionRunner` had never
+  actually been run together. `tests/
+  test_config_driven_live_pipeline.py` (Priority 12, 2026-07-14) loads
+  the real bundled `configs/example_gym.yaml`, builds real runners from
+  it, and runs a scripted session end to end, asserting real events
+  come out carrying the config's own exercise name and equipment
+  settings. This caught a real bug in the process: `station_runner_kwargs_for`
+  had included `camera_tilt_deg` since Priority 10, but
+  `StationSessionRunner.__init__` had no matching parameter to receive
+  it -- any configured camera tilt correction was silently dropped on
+  the floor and never reached `RepSession`'s bar-velocity calculation.
+  Fixed the same day it was found; see `irix/live/station_runner.py`'s
+  `camera_tilt_deg` parameter and its docstring for the account.
 
 ## What's not validated (real limitations, stated plainly)
 

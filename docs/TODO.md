@@ -5,6 +5,28 @@ completed this phase removed, new gaps this phase's work surfaced added.
 
 ## High priority
 
+- [x] ~~Validation report generator~~ -- done (Priority 12):
+      `irix.validation.report_generator` (`python -m irix.validation.
+      report_generator`) runs the real test suite as a subprocess and
+      (optionally) `irix.benchmark.run_benchmarks`, producing a dated
+      Markdown/JSON report with real pass/fail/skip counts instead of
+      `docs/VALIDATION.md`'s numbers going stale by hand (they had:
+      237 claimed vs. 389 actual before this was built). Deliberately
+      does not auto-generate `docs/VALIDATION.md`'s qualitative
+      sections -- those need human judgment about what a passing test
+      proves.
+- [x] ~~Config system validated end to end with the live orchestration
+      layer~~ -- done (Priority 12):
+      `tests/test_config_driven_live_pipeline.py` loads
+      `configs/example_gym.yaml` for real and runs a scripted session
+      through real `StationSessionRunner`/`GymSessionRunner` objects
+      built from it. Caught and fixed a real bug in the process:
+      `camera_tilt_deg` (in `station_runner_kwargs_for` since Priority
+      10) had no matching `StationSessionRunner.__init__` parameter and
+      was silently dropped -- same class of gap as the earlier
+      `bar_weight_kg` fix. Fixed same day; see `irix/live/
+      station_runner.py`.
+
 - [x] ~~IRIX Studio backend interface~~ -- done (Priority 11):
       `irix.backend.studio_api.StudioBackendAPI` (`assign_wristband`,
       `return_wristband`, `start_session`, `end_session`,
