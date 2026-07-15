@@ -1499,7 +1499,7 @@ deep-ReID tracking upgrade (unnecessary at this scale, see
 out of scope for this phase per the founding brief -- "the objective is
 no longer to improve infrastructure").
 
-## Phase 3: production pipeline integration (2026-07-14, in progress)
+## Phase 3: production pipeline integration (2026-07-14, complete except Priority 13)
 
 Phase 2 built and unit-tested individual accuracy modules in isolation.
 Phase 3's objective is different: stop adding isolated modules and
@@ -1602,10 +1602,41 @@ tracking-loss pair is wired to a real emission source so far (a
 consecutive-missed-frame streak in `StationSessionRunner`'s
 single-candidate path) -- see `docs/TODO.md` for what's left.
 
-**What's still open going into the rest of Phase 3**: unifying load
-detection into one authoritative status/evidence shape (Priority 7),
-session-recording/data-collection tooling (Priority 8), identity/event
-latency benchmarks (Priority 9), an external per-gym configuration system
-(Priority 10), the IRIX Studio backend interface (Priority 11), expanded
-multi-condition validation reporting (Priority 12). Tracked in
-`docs/TODO.md` and the session's own task list, in that priority order.
+**Priorities 7-12, completed the same day**: unified load detection
+(Priority 7) -- `RepSession`'s weight-check block now runs color-plate
+detection unconditionally (`method="color_plate"`), cross-checked
+against a VLM read when configured, with confidence/evidence/units/
+method/status on every `WeightConfirmedEvent`, never a fabricated
+weight. Session-recording/data-collection tooling (Priority 8) --
+`irix.recording.session_recorder.SessionRecorder`, deterministic replay
+via `load_recorded_session`, `save_raw_frames=False` by default to stay
+consistent with the production pipeline's "never raw video" principle.
+Identity-resolution and event-emission latency benchmarks (Priority 9)
+added to `irix.benchmark.run_benchmarks`. An external per-gym YAML/JSON
+configuration system (Priority 10, `irix.config.gym_config`) moving
+every gym-specific assumption (station layout, thresholds, equipment)
+out of hardcoded Python, deliberately excluding hardware bindings. The
+IRIX Studio backend interface (Priority 11, `irix.backend.studio_api.
+StudioBackendAPI`) -- assign/return wristband, start/end session, query
+battery/assignment/status, all backed by real `CheckoutRegistry`/
+`GymSessionRunner` state; `query_battery` honestly reports `"unknown"`
+since no battery signal exists anywhere in this repo. Every
+`CameraEvent` now carries `EVENT_SCHEMA_VERSION`. Validation expansion
+and a report generator (Priority 12, `irix.validation.
+report_generator`) -- a real subprocess-`pytest` run plus the benchmark
+suite, dated Markdown/JSON output, no fabricated pass counts; building
+its integration test (`tests/test_config_driven_live_pipeline.py`, the
+config system run together with the live orchestration layer for the
+first time) caught and fixed a real bug: `camera_tilt_deg` had been
+threaded into `station_runner_kwargs_for` since Priority 10 but
+`StationSessionRunner.__init__` had no matching parameter, silently
+dropping it -- same class of gap as the earlier `bar_weight_kg` fix.
+
+All twelve of the founding brief's numbered integration priorities are
+now real. What remains is genuinely hardware- and credential-gated:
+Priority 13 (verified GitHub push) is blocked on this sandbox having no
+SSH key or HTTPS credential helper -- reported honestly on every attempt,
+never claimed to succeed when it didn't; see `docs/TODO.md`'s
+lower-priority section for the remaining real-hardware-dependent gaps
+(barbell/plate detector training data, real camera/wristband hardware
+validation, real edge-device latency benchmarking).

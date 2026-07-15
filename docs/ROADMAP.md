@@ -61,24 +61,38 @@ checklist. Each item: current status, and what's left.
     margin, CPU/memory -- honestly reports GPU/real-pose-inference FPS as
     unavailable in this sandboxed (no CUDA/ultralytics) environment
     rather than fabricating a number.
-16. **Generate validation reports.** Partial -- `docs/VALIDATION.md`
-    documents current test coverage and known gaps; benchmark reports
-    (above) now exist. Still no ground-truth accuracy report (needs real
-    labeled gym video -- see `docs/VALIDATION.md`).
+16. **Generate validation reports.** Real as of Phase 3 (Priority 12) --
+    `python -m irix.validation.report_generator` produces a dated
+    Markdown/JSON report with real subprocess-`pytest` pass/fail/skip
+    counts plus the benchmark suite, never fabricated numbers.
+    `docs/VALIDATION.md` still carries the qualitative "what's
+    genuinely validated end to end" assessment by hand -- that requires
+    human judgment the generator doesn't attempt to automate. Still no
+    ground-truth accuracy report (needs real labeled gym video -- see
+    `docs/VALIDATION.md`).
 17. **Produce documentation explaining every subsystem.** Real as of
     2026-07-14 -- the full `docs/` suite this file is part of, plus the
     pre-existing `docs/ARCHITECTURE.md`.
 
 ## Near-term priority (see `docs/TODO.md` for the itemized list)
 
-1. Wire `irix.wristband_sim.calibration` into `run_upload.py`/
-   `StationSessionRunner` so a real deployment's samples actually get
-   calibrated before reaching fusion, not just validated in isolation.
-2. Add `schema_version` to the event API (`docs/API_SPEC.md`).
-3. Scope and add the missing event types (`ExerciseDetected`/
-   `RestStarted`/`RestEnded`/`TrackingLost`/`TrackingRecovered`).
-4. Build the external config system for per-gym station/camera layout.
-5. Barbell/plate detector: either fine-tune against the Roboflow
+Items 2-4 below (schema versioning, the missing event types, and the
+config system) were completed during Phase 3 (Priorities 6, 10, 11).
+What remains:
+
+1. Wire `irix.wristband_sim.calibration` into an ordinary session that
+   never changes placement -- currently only re-calibrates on a
+   placement-change settle (`irix.identity.placement.
+   WristbandPlacementTracker`), so a session that starts and stays on
+   one limb the whole time still runs on raw, uncalibrated samples from
+   the start.
+2. Wire `irix.exercise_recognition.recognize_exercise` into session
+   start (the top `docs/TODO.md` item) -- still only
+   `StationInfo.default_exercise` actually drives `RepSession` today.
+3. Barbell/plate detector: either fine-tune against the Roboflow
    "Barbells Detector" dataset or evaluate a hosted inference API,
    closing the last major stubbed model-weights gap (see
    `docs/RESEARCH_LOG.md`).
+4. Wrap `irix.backend.studio_api.StudioBackendAPI` in a real network
+   transport (REST/gRPC) once an actual Studio project exists to
+   consume it -- today it's callable in-process only.
